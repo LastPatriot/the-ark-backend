@@ -58,7 +58,15 @@ pub struct FileItem {
     /// PIN or join-token label of the uploader.
     pub uploaded_by: Option<String>,
     pub created_at: String,
+    /// Ready previews: `thumb` (images), `poster` and `hls` (videos). Fetch from
+    /// `/preview/{id}/{kind}`; HLS plays from `/preview/{id}/hls/index.m3u8`.
+    #[schema(value_type = Vec<String>, example = json!(["thumb"]))]
+    pub previews: sqlx::types::Json<Vec<String>>,
 }
+
+/// Columns for `FileItem`, selecting from `files`.
+pub const FILE_ITEM_COLUMNS: &str = "id, name, size, mime, version, status_tag, uploaded_by, created_at,
+    (SELECT json_group_array(kind) FROM previews p WHERE p.file_id = files.id AND p.status = 'ready') AS previews";
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ItemsResponse {
@@ -444,12 +452,12 @@ pub async fn list_items(
     .await?;
 
     let own_only = (session.role == Role::Uploader).then_some(&session.id);
-    let files: Vec<FileItem> = sqlx::query_as(
-        "SELECT id, name, size, mime, version, status_tag, uploaded_by, created_at FROM files
+    let files: Vec<FileItem> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT {FILE_ITEM_COLUMNS} FROM files
          WHERE folder_id = ? AND is_current = 1 AND deleted_at IS NULL
            AND (?2 IS NULL OR session_id = ?2)
-         ORDER BY created_at DESC",
-    )
+         ORDER BY created_at DESC"
+    )))
     .bind(&folder.id)
     .bind(own_only)
     .fetch_all(&state.db)

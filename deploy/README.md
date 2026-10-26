@@ -49,6 +49,21 @@ Port 53 conflicts: Ubuntu's systemd-resolved (install.sh offers to disable its s
 listener); on Windows, Internet Connection Sharing or Hyper-V's default switch.
 Check with `sudo ss -lunp 'sport = :53'` / `Get-NetUDPEndpoint -LocalPort 53`.
 
+## Video previews, cloud backup, remote access
+
+- **Video previews** need `ffmpeg` on the PATH (`sudo apt install ffmpeg`; Windows: put
+  `ffmpeg.exe` next to `ark.exe` and set `ffmpeg = 'C:\Program Files\Ark\ffmpeg.exe'`).
+  Posters are cheap; 720p HLS is a full transcode, so set `ARK_HLS=false` on slow hosts.
+- **Cloud backup**: install rclone, run `rclone config` as the user Ark runs as (on Linux:
+  `sudo -u ark rclone config`, stored in /var/lib/ark/.config/rclone), then set
+  `ARK_SYNC_REMOTE`. New files upload in the background while the internet is reachable;
+  status at `GET /api/v1/admin/sync`.
+- **Remote access**: install `cloudflared`, then as admin `PUT /api/v1/admin/tunnel` with an
+  empty body for a quick tunnel (random `*.trycloudflare.com` URL, no account), or
+  `{"token": "...", "hostname": "ark.example.org"}` for a named tunnel from the Cloudflare
+  dashboard. It restarts with Ark until `DELETE /api/v1/admin/tunnel`. Anyone on the
+  internet can then reach the PIN pages, so use 6+ digit PINs and consider `ARK_DOCS=false`.
+
 ## Checks before the demo
 
 ```bash

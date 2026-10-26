@@ -166,11 +166,11 @@ impl FromRequestParts<AppState> for Auth {
             }
         }
 
-        let ip = parts
+        let peer = parts
             .extensions
             .get::<ConnectInfo<SocketAddr>>()
-            .map(|ci| ci.0.ip().to_string())
-            .unwrap_or_else(|| "unknown".into());
+            .map(|ci| ci.0.ip());
+        let ip = client_ip(peer, &parts.headers);
         let secure = parts
             .headers
             .get("x-forwarded-proto")
@@ -182,6 +182,24 @@ impl FromRequestParts<AppState> for Auth {
             secure,
         })
     }
+}
+
+/// The client address used for rate limiting and audit. Requests through Cloudflare
+/// Tunnel arrive from cloudflared on this machine, so `CF-Connecting-IP` is trusted,
+/// but only from loopback: anyone on the LAN could send that header.
+fn client_ip(peer: Option<std::net::IpAddr>, headers: &axum::http::HeaderMap) -> String {
+    let Some(peer) = peer else {
+        return "unknown".into();
+    };
+    if peer.is_loopback()
+        && let Some(real) = headers
+            .get("cf-connecting-ip")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<std::net::IpAddr>().ok())
+    {
+        return real.to_string();
+    }
+    peer.to_string()
 }
 
 impl Auth {
@@ -335,6 +353,23 @@ mod tests {
     #[test]
     fn viewer_preferred_over_uploader() {
         assert!(Viewer.rank() > Uploader.rank());
+    }
+
+    #[test]
+    fn tunnel_client_ip() {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert("cf-connecting-ip", "203.0.113.7".parse().unwrap());
+        let lo = Some("127.0.0.1".parse().unwrap());
+        let lan = Some("192.168.1.20".parse().unwrap());
+        assert_eq!(client_ip(lo, &h), "203.0.113.7");
+        assert_eq!(
+            client_ip(lan, &h),
+            "192.168.1.20",
+            "LAN clients cannot spoof it"
+        );
+        assert_eq!(client_ip(lo, &axum::http::HeaderMap::new()), "127.0.0.1");
+        h.insert("cf-connecting-ip", "nonsense".parse().unwrap());
+        assert_eq!(client_ip(lo, &h), "127.0.0.1");
     }
 
     #[test]

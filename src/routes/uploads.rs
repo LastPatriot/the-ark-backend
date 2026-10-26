@@ -35,7 +35,7 @@ use crate::{
     db,
     error::{AppError, AppResult, ErrorBody},
     storage, util,
-    workers::thumbnails,
+    workers::{sync, thumbnails, video},
 };
 
 pub const TUS_VERSION: &str = "1.0.0";
@@ -727,6 +727,12 @@ async fn finalize(state: &AppState, up: &UploadRow, actor: &str) -> AppResult<St
     .await?;
     if let Err(e) = thumbnails::queue(state, &file_id, mime.as_deref()).await {
         tracing::error!(error = ?e, file = file_id, "queueing thumbnail");
+    }
+    if let Err(e) = video::queue(state, &file_id, mime.as_deref()).await {
+        tracing::error!(error = ?e, file = file_id, "queueing video previews");
+    }
+    if let Err(e) = sync::queue_upload(state, &file_id).await {
+        tracing::error!(error = ?e, file = file_id, "queueing cloud sync");
     }
     publish(
         state,

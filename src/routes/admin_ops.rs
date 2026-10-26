@@ -16,8 +16,13 @@ use crate::{
     auth::{Auth, Role},
     db,
     error::{AppError, AppResult, ErrorBody},
-    qr, util,
-    workers::trash,
+    qr,
+    tunnel::{self, Mode, TunnelStatus},
+    util,
+    workers::{
+        sync::{self, SyncStatus},
+        trash,
+    },
 };
 
 /// An active session. Session ids are credentials, so sessions are identified by a
@@ -449,7 +454,11 @@ pub async fn qr_code(
     Query(q): Query<QrQuery>,
 ) -> AppResult<Response> {
     auth.admin()?;
-    if !is_ark_url(&q.url, &state.cfg.hostname) {
+    let via_tunnel = state
+        .tunnel
+        .public_host()
+        .is_some_and(|host| q.url.starts_with(&format!("https://{host}/")));
+    if !via_tunnel && !is_ark_url(&q.url, &state.cfg.hostname) {
         return Err(AppError::bad_request(
             "invalid_url",
             format!("QR links must start with {}/", qr::public_base(&state.cfg)),
@@ -462,6 +471,173 @@ pub async fn qr_code(
         QrFormat::Png => ([(header::CONTENT_TYPE, "image/png")], qr::png(&q.url)?).into_response(),
     };
     Ok(resp)
+}
+
+/// Cloud backup status (`ARK_SYNC_REMOTE`).
+#[utoipa::path(
+    get,
+    path = "/api/v1/admin/sync",
+    tag = "admin",
+    security(("ark_session" = []), ("bearer" = [])),
+    responses(
+        (status = 200, body = SyncStatus),
+        (status = 401, body = ErrorBody),
+        (status = 403, body = ErrorBody),
+    )
+)]
+pub async fn sync_status(State(state): State<AppState>, auth: Auth) -> AppResult<Json<SyncStatus>> {
+    auth.admin()?;
+    Ok(Json(sync::status(&state).await?))
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct RetryResult {
+    pub requeued: u64,
+}
+
+/// Requeue sync jobs that gave up.
+#[utoipa::path(
+    post,
+    path = "/api/v1/admin/sync/retry",
+    tag = "admin",
+    security(("ark_session" = []), ("bearer" = [])),
+    responses(
+        (status = 200, body = RetryResult),
+        (status = 401, body = ErrorBody),
+        (status = 403, body = ErrorBody),
+    )
+)]
+pub async fn sync_retry(State(state): State<AppState>, auth: Auth) -> AppResult<Json<RetryResult>> {
+    let admin = auth.admin()?;
+    let requeued = sync::retry_failed(&state).await?;
+    db::audit(
+        &state.db,
+        &admin.actor,
+        "sync.retry",
+        None,
+        Some(serde_json::json!({ "jobs": requeued })),
+    )
+    .await?;
+    Ok(Json(RetryResult { requeued }))
+}
+
+#[derive(Debug, Default, Deserialize, ToSchema)]
+pub struct TunnelRequest {
+    /// Connector token of a named tunnel from the Cloudflare dashboard. Omit for a
+    /// quick tunnel (random `*.trycloudflare.com` URL, no account needed).
+    pub token: Option<String>,
+    /// Public hostname routed to this tunnel in the dashboard, e.g. `ark.example.org`.
+    /// Named tunnels only; used for status and QR codes.
+    pub hostname: Option<String>,
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/admin/tunnel",
+    tag = "admin",
+    security(("ark_session" = []), ("bearer" = [])),
+    responses(
+        (status = 200, body = TunnelStatus),
+        (status = 401, body = ErrorBody),
+        (status = 403, body = ErrorBody),
+    )
+)]
+pub async fn tunnel_status(
+    State(state): State<AppState>,
+    auth: Auth,
+) -> AppResult<Json<TunnelStatus>> {
+    auth.admin()?;
+    Ok(Json(state.tunnel.status()))
+}
+
+/// Start (or restart) the Cloudflare Tunnel; it also starts on every boot until
+/// disabled. Waits up to 20 s for the tunnel to come up, then returns its status.
+#[utoipa::path(
+    put,
+    path = "/api/v1/admin/tunnel",
+    tag = "admin",
+    request_body = TunnelRequest,
+    security(("ark_session" = []), ("bearer" = [])),
+    responses(
+        (status = 200, description = "Check `connected`, `public_url` and `last_error`", body = TunnelStatus),
+        (status = 400, body = ErrorBody),
+        (status = 401, body = ErrorBody),
+        (status = 403, body = ErrorBody),
+    )
+)]
+pub async fn tunnel_enable(
+    State(state): State<AppState>,
+    auth: Auth,
+    body: Option<Json<TunnelRequest>>,
+) -> AppResult<Json<TunnelStatus>> {
+    let admin = auth.admin()?;
+    let req = body.map(|Json(r)| r).unwrap_or_default();
+    let mode = match req
+        .token
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+    {
+        None => Mode::Quick,
+        Some(token) => {
+            let hostname = req
+                .hostname
+                .map(|h| h.trim().trim_end_matches('/').to_ascii_lowercase());
+            if let Some(h) = &hostname {
+                let valid = !h.is_empty()
+                    && h.contains('.')
+                    && h.chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-');
+                if !valid {
+                    return Err(AppError::bad_request(
+                        "invalid_hostname",
+                        "hostname must be a bare host name like ark.example.org",
+                    ));
+                }
+            }
+            Mode::Named { token, hostname }
+        }
+    };
+    let quick = mode == Mode::Quick;
+    tunnel::enable(&state, mode).await?;
+    db::audit(
+        &state.db,
+        &admin.actor,
+        "tunnel.enable",
+        None,
+        Some(serde_json::json!({ "mode": if quick { "quick" } else { "named" } })),
+    )
+    .await?;
+
+    for _ in 0..40 {
+        let s = state.tunnel.status();
+        if (s.connected && s.public_url.is_some())
+            || (s.connected && !quick)
+            || s.last_error.is_some()
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    Ok(Json(state.tunnel.status()))
+}
+
+/// Stop the tunnel and forget its settings.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/admin/tunnel",
+    tag = "admin",
+    security(("ark_session" = []), ("bearer" = [])),
+    responses(
+        (status = 204, description = "Stopped"),
+        (status = 401, body = ErrorBody),
+        (status = 403, body = ErrorBody),
+    )
+)]
+pub async fn tunnel_disable(State(state): State<AppState>, auth: Auth) -> AppResult<StatusCode> {
+    let admin = auth.admin()?;
+    tunnel::disable(&state).await?;
+    db::audit(&state.db, &admin.actor, "tunnel.disable", None, None).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[cfg(test)]

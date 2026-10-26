@@ -14,7 +14,7 @@ use utoipa::ToSchema;
 
 use super::{
     events::{EventKind, publish},
-    folders::{FileItem, FolderSummary, folder_path, join_path},
+    folders::{FILE_ITEM_COLUMNS, FileItem, FolderSummary, folder_path, join_path},
 };
 use crate::{
     AppState,
@@ -120,9 +120,9 @@ async fn live_folder(db: &SqlitePool, id: &str) -> AppResult<String> {
 }
 
 pub async fn file_item(db: &SqlitePool, id: &str) -> sqlx::Result<FileItem> {
-    sqlx::query_as(
-        "SELECT id, name, size, mime, version, status_tag, uploaded_by, created_at FROM files WHERE id = ?",
-    )
+    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT {FILE_ITEM_COLUMNS} FROM files WHERE id = ?"
+    )))
     .bind(id)
     .fetch_one(db)
     .await

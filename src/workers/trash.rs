@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 
+use super::sync;
 use crate::{AppState, db, storage, util};
 
 const TRASH_DAYS: i64 = 30;
@@ -48,15 +49,17 @@ pub async fn purge(state: &AppState, before: Option<&str>) -> anyhow::Result<u64
                 .fetch_all(&state.db)
                 .await?;
         for p in previews {
-            remove_if_exists(&storage::preview_path(&state.cfg, &p)).await?;
+            let path = storage::preview_path(&state.cfg, &p);
+            if tokio::fs::metadata(&path).await.is_ok_and(|m| m.is_dir()) {
+                tokio::fs::remove_dir_all(&path).await?;
+            } else {
+                remove_if_exists(&path).await?;
+            }
         }
 
+        sync::queue_delete(state, &id).await?;
         let mut tx = db::begin_write(&state.db).await?;
         sqlx::query("DELETE FROM previews WHERE file_id = ?")
-            .bind(&id)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("DELETE FROM sync_queue WHERE file_id = ?")
             .bind(&id)
             .execute(&mut *tx)
             .await?;

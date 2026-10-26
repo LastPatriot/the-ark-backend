@@ -6,3 +6,4 @@ pub mod folders;
 pub mod items;
 pub mod join;
 pub mod uploads;
+pub mod zip;

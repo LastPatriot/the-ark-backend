@@ -10,6 +10,7 @@ mod routes;
 mod storage;
 #[cfg(test)]
 mod tests;
+mod tunnel;
 mod util;
 mod workers;
 
@@ -53,6 +54,11 @@ pub struct AppState {
     pub events: routes::events::Events,
     /// Wakes the thumbnail worker.
     pub thumbs: Arc<tokio::sync::Notify>,
+    /// Wakes the video preview worker.
+    pub videos: Arc<tokio::sync::Notify>,
+    pub zips: Arc<routes::zip::ZipJobs>,
+    pub tunnel: Arc<tunnel::Tunnel>,
+    pub sync: Arc<workers::sync::SyncState>,
 }
 
 /// First-run state: until the admin password is set only `/admin/setup` works.
@@ -81,9 +87,14 @@ async fn main() -> anyhow::Result<()> {
 
     let state = build_state(Config::load()?).await?;
     workers::thumbnails::spawn(state.clone());
+    workers::video::spawn(state.clone());
+    workers::sync::spawn(state.clone());
     workers::trash::spawn(state.clone());
     discovery::spawn(state.cfg.clone());
     dns::spawn(state.cfg.clone());
+    if let Err(e) = tunnel::resume(&state).await {
+        tracing::error!(error = ?e, "resuming tunnel");
+    }
     let app = app(state.clone());
 
     let listener = tokio::net::TcpListener::bind(state.cfg.bind)
@@ -140,6 +151,10 @@ pub async fn build_state(cfg: Config) -> anyhow::Result<AppState> {
         uploads: Arc::default(),
         events: routes::events::channel(),
         thumbs: Arc::default(),
+        videos: Arc::default(),
+        zips: Arc::default(),
+        tunnel: Arc::default(),
+        sync: Arc::default(),
     })
 }
 
@@ -177,6 +192,7 @@ pub fn app(state: AppState) -> Router {
         .route("/items/{id}/restore", post(routes::items::restore))
         .route("/files/{id}/versions", get(routes::items::versions))
         .route("/events", get(routes::events::events))
+        .route("/zip", post(routes::zip::create))
         .route("/admin/setup", post(auth::admin::setup))
         .route("/admin/login", post(auth::admin::login))
         .route(
@@ -207,6 +223,14 @@ pub fn app(state: AppState) -> Router {
             delete(routes::admin_ops::end_session),
         )
         .route("/admin/activity", get(routes::admin_ops::activity))
+        .route("/admin/sync", get(routes::admin_ops::sync_status))
+        .route("/admin/sync/retry", post(routes::admin_ops::sync_retry))
+        .route(
+            "/admin/tunnel",
+            get(routes::admin_ops::tunnel_status)
+                .put(routes::admin_ops::tunnel_enable)
+                .delete(routes::admin_ops::tunnel_disable),
+        )
         .route("/admin/storage", get(routes::admin_ops::storage_report))
         .route(
             "/admin/trash",
@@ -221,7 +245,12 @@ pub fn app(state: AppState) -> Router {
         .route("/healthz", get(healthz))
         .route("/dl/{file_id}", get(routes::downloads::download))
         .route("/preview/{file_id}/{kind}", get(routes::downloads::preview))
+        .route(
+            "/preview/{file_id}/hls/{name}",
+            get(routes::downloads::preview_hls),
+        )
         .route("/j/{token}", get(routes::join::join))
+        .route("/zip/{token}", get(routes::zip::download))
         .nest("/api/v1", api);
     if state.cfg.docs {
         // Until the frontend exists, its pages lead to the API docs.

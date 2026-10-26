@@ -20,6 +20,16 @@ pub struct Config {
     /// Resolver for every other name. Defaults to the first usable `nameserver` in
     /// /etc/resolv.conf, else 1.1.1.1. Set it to the router's IP on the demo network.
     pub dns_upstream: Option<SocketAddr>,
+    /// ffmpeg binary for video posters and HLS previews.
+    pub ffmpeg: String,
+    /// Transcode videos to 720p HLS. Posters are made either way. Turn off on slow hosts.
+    pub hls: bool,
+    /// rclone destination for cloud backup, e.g. `b2:ark-backup/church`. Unset = no sync.
+    pub sync_remote: Option<String>,
+    pub rclone: String,
+    /// `host:port` probed (TCP) to decide whether the internet is reachable.
+    pub sync_check: String,
+    pub cloudflared: String,
 }
 
 /// Mirrors `Config`; every key optional. Keys are the env names without `ARK_`, lowercased.
@@ -35,6 +45,12 @@ struct FileConfig {
     dns: Option<bool>,
     dns_bind: Option<String>,
     dns_upstream: Option<String>,
+    ffmpeg: Option<String>,
+    hls: Option<bool>,
+    sync_remote: Option<String>,
+    rclone: Option<String>,
+    sync_check: Option<String>,
+    cloudflared: Option<String>,
 }
 
 impl Config {
@@ -85,6 +101,20 @@ impl Config {
             dns: parse_env("ARK_DNS")?.or(file.dns).unwrap_or(false),
             dns_bind,
             dns_upstream,
+            ffmpeg: env("ARK_FFMPEG")
+                .or(file.ffmpeg)
+                .unwrap_or_else(|| "ffmpeg".into()),
+            hls: parse_env("ARK_HLS")?.or(file.hls).unwrap_or(true),
+            sync_remote: env("ARK_SYNC_REMOTE").or(file.sync_remote),
+            rclone: env("ARK_RCLONE")
+                .or(file.rclone)
+                .unwrap_or_else(|| "rclone".into()),
+            sync_check: env("ARK_SYNC_CHECK")
+                .or(file.sync_check)
+                .unwrap_or_else(|| "1.1.1.1:443".into()),
+            cloudflared: env("ARK_CLOUDFLARED")
+                .or(file.cloudflared)
+                .unwrap_or_else(|| "cloudflared".into()),
         })
     }
 
@@ -102,6 +132,12 @@ impl Config {
             dns: false,
             dns_bind: "127.0.0.1:0".parse().unwrap(),
             dns_upstream: None,
+            ffmpeg: "ffmpeg".into(),
+            hls: false,
+            sync_remote: None,
+            rclone: "rclone".into(),
+            sync_check: "127.0.0.1:9".into(),
+            cloudflared: "cloudflared".into(),
         }
     }
 

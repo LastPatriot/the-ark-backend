@@ -134,12 +134,13 @@ pub async fn download(
     Ok((status, h, body).into_response())
 }
 
-/// A file's thumbnail (JPEG, longest edge 480 px). 404 until the worker has made it.
+/// A file's image preview: `thumb` (images, longest edge 480 px) or `poster` (a video
+/// frame, 480 px wide). JPEG. 404 until a worker has made it.
 #[utoipa::path(
     get,
     path = "/preview/{file_id}/{kind}",
     tag = "downloads",
-    params(("file_id" = String, Path), ("kind" = String, Path, description = "`thumb`")),
+    params(("file_id" = String, Path), ("kind" = String, Path, description = "`thumb` or `poster`")),
     security(("ark_session" = []), ("bearer" = [])),
     responses(
         (status = 200, description = "JPEG", content_type = "image/jpeg", body = crate::routes::uploads::BinaryBody),
@@ -153,14 +154,67 @@ pub async fn preview(
     auth: Auth,
     Path((file_id, kind)): Path<(String, String)>,
 ) -> AppResult<Response> {
+    if !matches!(kind.as_str(), "thumb" | "poster") {
+        return Err(AppError::NotFound);
+    }
+    let name = preview_access(&state, &auth, &file_id, &kind).await?;
+    serve_preview(storage::preview_path(&state.cfg, &name), "image/jpeg").await
+}
+
+/// HLS rendition of a video (720p H.264/AAC). Point a player (hls.js, or Safari and
+/// iOS natively) at `/preview/{file_id}/hls/index.m3u8`; segments load relative to it.
+#[utoipa::path(
+    get,
+    path = "/preview/{file_id}/hls/{name}",
+    tag = "downloads",
+    params(("file_id" = String, Path), ("name" = String, Path, description = "`index.m3u8` or `seg_NNNN.ts`")),
+    security(("ark_session" = []), ("bearer" = [])),
+    responses(
+        (status = 200, description = "Playlist or MPEG-TS segment", content(("application/vnd.apple.mpegurl"), ("video/mp2t"))),
+        (status = 401, body = ErrorBody),
+        (status = 403, body = ErrorBody),
+        (status = 404, description = "No HLS rendition (yet)", body = ErrorBody),
+    )
+)]
+pub async fn preview_hls(
+    State(state): State<AppState>,
+    auth: Auth,
+    Path((file_id, name)): Path<(String, String)>,
+) -> AppResult<Response> {
+    let content_type = hls_content_type(&name).ok_or(AppError::NotFound)?;
+    let dir = preview_access(&state, &auth, &file_id, "hls").await?;
+    serve_preview(
+        storage::preview_path(&state.cfg, &dir).join(&name),
+        content_type,
+    )
+    .await
+}
+
+/// Only the names ffmpeg writes: `index.m3u8` and `seg_0000.ts`.
+fn hls_content_type(name: &str) -> Option<&'static str> {
+    if name == "index.m3u8" {
+        return Some("application/vnd.apple.mpegurl");
+    }
+    let n = name.strip_prefix("seg_")?.strip_suffix(".ts")?;
+    (!n.is_empty() && n.len() <= 6 && n.bytes().all(|b| b.is_ascii_digit())).then_some("video/mp2t")
+}
+
+/// Checks viewer-level access to a ready preview and returns its stored name.
+/// Uploaders only see previews of their own files.
+async fn preview_access(
+    state: &AppState,
+    auth: &Auth,
+    file_id: &str,
+    kind: &str,
+) -> AppResult<String> {
     let row: Option<(String, Option<String>, String)> = sqlx::query_as(
         "SELECT f.folder_id, f.session_id, p.path
          FROM previews p JOIN files f ON f.id = p.file_id JOIN folders d ON d.id = f.folder_id
          WHERE p.file_id = ? AND p.kind = ? AND p.status = 'ready'
            AND f.deleted_at IS NULL AND d.archived_at IS NULL",
     )
-    .bind(&file_id)
-    .bind(&kind)
+    .bind(file_id)
+    .bind(kind)
     .fetch_optional(&state.db)
     .await?;
     let (folder_id, owner, name) = row.ok_or(AppError::NotFound)?;
@@ -168,17 +222,23 @@ pub async fn preview(
     if session.role == Role::Uploader && owner.as_deref() != Some(session.id.as_str()) {
         return Err(AppError::Forbidden);
     }
+    Ok(name)
+}
 
-    let data = match tokio::fs::read(storage::preview_path(&state.cfg, &name)).await {
+async fn serve_preview(
+    path: std::path::PathBuf,
+    content_type: &'static str,
+) -> AppResult<Response> {
+    let data = match tokio::fs::read(path).await {
         Ok(d) => d,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(AppError::NotFound),
         Err(e) => return Err(e.into()),
     };
     Ok((
         [
-            (header::CONTENT_TYPE, "image/jpeg"),
+            (header::CONTENT_TYPE, content_type),
             (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
-            // A file id's content never changes, so neither does its preview.
+            // A file id's content never changes, so neither do its previews.
             (header::CACHE_CONTROL, "private, max-age=86400"),
         ],
         data,
@@ -268,6 +328,25 @@ mod tests {
         assert_eq!(parse_range("bytes=0-1,5-9", 1000), Ok(None));
         assert_eq!(parse_range("items=0-1", 1000), Ok(None));
         assert_eq!(parse_range("bytes=abc", 1000), Ok(None));
+    }
+
+    #[test]
+    fn hls_names() {
+        assert_eq!(
+            hls_content_type("index.m3u8"),
+            Some("application/vnd.apple.mpegurl")
+        );
+        assert_eq!(hls_content_type("seg_0007.ts"), Some("video/mp2t"));
+        for bad in [
+            "../index.m3u8",
+            "seg_.ts",
+            "seg_1.ts.bak",
+            "seg_../x.ts",
+            "x.m3u8",
+            "seg_1234567.ts",
+        ] {
+            assert_eq!(hls_content_type(bad), None, "{bad}");
+        }
     }
 
     #[test]
