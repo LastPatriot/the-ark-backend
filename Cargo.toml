@@ -10,8 +10,13 @@ axum = { version = "0.8.9", features = ["macros"] }
 axum-extra = { version = "0.12.6", features = ["cookie-signed"] }
 base64 = "0.23.1"
 chrono = { version = "0.4.45", features = ["serde"] }
+fs4 = "1.1.0"
 futures-util = "0.3.34"
+if-addrs = "0.15.0"
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
+mdns-sd = "0.21.6"
 mime_guess = "2.0.5"
+qrcode = "0.14.1"
 rand = "0.10.3"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
@@ -20,6 +25,7 @@ sqlx = { version = "0.9.0", default-features = false, features = ["sqlite", "run
 thiserror = "2.0.21"
 time = "0.3"
 tokio = { version = "1.54.1", features = ["full"] }
+tokio-stream = { version = "0.1.19", features = ["sync"] }
 tokio-util = { version = "0.7.20", features = ["io"] }
 toml = "1.1.8"
 tower-http = { version = "0.7.1", features = ["trace", "cors", "compression-full", "limit", "set-header"] }

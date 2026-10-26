@@ -15,16 +15,15 @@ use crate::{
     },
     db,
     error::{AppError, AppResult, ErrorBody, is_unique_violation},
+    routes::events::{EventKind, publish},
     storage, util,
 };
 
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct FolderRow {
     pub id: String,
-    pub parent_id: Option<String>,
     pub slug: String,
     pub name: String,
-    pub disk_dir: String,
     pub is_open: bool,
     pub default_role: Option<Role>,
     pub storage_limit: Option<i64>,
@@ -32,7 +31,8 @@ pub struct FolderRow {
     pub created_at: String,
 }
 
-pub const FOLDER_COLUMNS: &str = "id, parent_id, slug, name, disk_dir, is_open, default_role, storage_limit, archived_at, created_at";
+pub const FOLDER_COLUMNS: &str =
+    "id, slug, name, is_open, default_role, storage_limit, archived_at, created_at";
 
 /// A folder as seen by a scoped session.
 #[derive(Debug, Serialize, ToSchema)]
@@ -155,7 +155,7 @@ pub async fn folder_path(db: &SqlitePool, id: &str) -> AppResult<(String, String
     Ok((top, slugs.join("/")))
 }
 
-fn join_path(parent: &str, slug: &str) -> String {
+pub fn join_path(parent: &str, slug: &str) -> String {
     if parent.is_empty() {
         slug.to_string()
     } else {
@@ -166,7 +166,8 @@ fn join_path(parent: &str, slug: &str) -> String {
 #[derive(sqlx::FromRow)]
 struct PinCandidate {
     id: String,
-    folder_id: String,
+    /// Null for hub PINs.
+    folder_id: Option<String>,
     label: String,
     pin_hash: String,
     role: Role,
@@ -220,8 +221,6 @@ pub async fn unlock(
     pin::validate_pin(&entered)?;
 
     let lock_key = format!("pin:{}:{}", folder.id, auth.ip);
-    pin::check_lock(&state.db, &lock_key).await?;
-
     let now = util::now();
     let mut candidates: Vec<PinCandidate> = Vec::new();
     for id in &chain {
@@ -240,20 +239,7 @@ pub async fn unlock(
         }
     }
 
-    let hashes = candidates.iter().map(|c| c.pin_hash.clone()).collect();
-    let Some(idx) = pin::find_match(entered, hashes).await? else {
-        pin::record_failure(&state.db, &lock_key).await?;
-        return Err(AppError::Unauthorized(
-            "invalid_pin",
-            "PIN is incorrect".into(),
-        ));
-    };
-    let matched = &candidates[idx];
-    pin::record_success(&state.db, &lock_key).await?;
-    sqlx::query("UPDATE pins SET uses = uses + 1 WHERE id = ?")
-        .bind(&matched.id)
-        .execute(&state.db)
-        .await?;
+    let matched = match_pin(&state.db, &lock_key, entered, candidates).await?;
     db::audit(
         &state.db,
         &matched.label,
@@ -272,6 +258,128 @@ pub async fn unlock(
         Some(&matched.id),
     )
     .await
+}
+
+/// Checks `entered` against `candidates` under the lockout for `lock_key`, and counts
+/// the use of the matching PIN.
+async fn match_pin(
+    db: &SqlitePool,
+    lock_key: &str,
+    entered: String,
+    mut candidates: Vec<PinCandidate>,
+) -> AppResult<PinCandidate> {
+    pin::check_lock(db, lock_key).await?;
+    let hashes = candidates.iter().map(|c| c.pin_hash.clone()).collect();
+    let Some(idx) = pin::find_match(entered, hashes).await? else {
+        pin::record_failure(db, lock_key).await?;
+        return Err(AppError::Unauthorized(
+            "invalid_pin",
+            "PIN is incorrect".into(),
+        ));
+    };
+    pin::record_success(db, lock_key).await?;
+    let matched = candidates.swap_remove(idx);
+    sqlx::query("UPDATE pins SET uses = uses + 1 WHERE id = ?")
+        .bind(&matched.id)
+        .execute(db)
+        .await?;
+    Ok(matched)
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct HubUnlockRequest {
+    #[schema(example = "9090")]
+    pub pin: String,
+}
+
+/// Exchange the hub PIN for a hub session: the home page folder list and access to
+/// every folder (no admin rights).
+#[utoipa::path(
+    post,
+    path = "/api/v1/hub/unlock",
+    tag = "auth",
+    request_body = HubUnlockRequest,
+    responses(
+        (status = 200, description = "Hub session created; cookie set", body = SessionResponse),
+        (status = 400, description = "Malformed PIN", body = ErrorBody),
+        (status = 401, description = "Wrong PIN", body = ErrorBody),
+        (status = 429, description = "Locked out after repeated failures", body = ErrorBody),
+    )
+)]
+pub async fn hub_unlock(
+    State(state): State<AppState>,
+    auth: Auth,
+    jar: SignedCookieJar,
+    Json(req): Json<HubUnlockRequest>,
+) -> AppResult<(SignedCookieJar, Json<SessionResponse>)> {
+    pin::validate_pin(&req.pin)?;
+    let candidates: Vec<PinCandidate> = sqlx::query_as(
+        "SELECT id, folder_id, label, pin_hash, role FROM pins
+         WHERE folder_id IS NULL AND role = 'hub' AND revoked_at IS NULL
+           AND (expires_at IS NULL OR expires_at > ?)
+           AND (max_uses IS NULL OR uses < max_uses)",
+    )
+    .bind(util::now())
+    .fetch_all(&state.db)
+    .await?;
+    let lock_key = format!("pin:hub:{}", auth.ip);
+    let matched = match_pin(&state.db, &lock_key, req.pin, candidates).await?;
+    db::audit(&state.db, &matched.label, "hub.unlock", None, None).await?;
+
+    let (session_id, cookie) = create_session(
+        &state,
+        &auth,
+        NewSession {
+            root_folder: None,
+            role: Role::Hub,
+            pin_id: Some(&matched.id),
+            token_id: None,
+        },
+    )
+    .await?;
+    Ok((
+        jar.add(cookie),
+        Json(SessionResponse {
+            session_id,
+            role: Role::Hub,
+            root_folder: None,
+        }),
+    ))
+}
+
+#[derive(Debug, Serialize, ToSchema, sqlx::FromRow)]
+pub struct HubFolder {
+    pub id: String,
+    pub slug: String,
+    pub name: String,
+    /// Open folders need no PIN.
+    pub is_open: bool,
+}
+
+/// Top-level folders for the home page.
+#[utoipa::path(
+    get,
+    path = "/api/v1/folders",
+    tag = "folders",
+    security(("ark_session" = []), ("bearer" = [])),
+    responses(
+        (status = 200, body = Vec<HubFolder>),
+        (status = 401, body = ErrorBody),
+        (status = 403, description = "Needs a hub or admin session", body = ErrorBody),
+    )
+)]
+pub async fn list_folders(
+    State(state): State<AppState>,
+    auth: Auth,
+) -> AppResult<Json<Vec<HubFolder>>> {
+    auth.hub()?;
+    let rows = sqlx::query_as(
+        "SELECT id, slug, name, is_open FROM folders
+         WHERE parent_id IS NULL AND archived_at IS NULL ORDER BY name COLLATE NOCASE",
+    )
+    .fetch_all(&state.db)
+    .await?;
+    Ok(Json(rows))
 }
 
 async fn folder_session(
@@ -436,6 +544,16 @@ pub async fn create_subfolder(
         Some(serde_json::json!({ "parent": parent.id, "name": name })),
     )
     .await?;
+
+    publish(
+        &state,
+        EventKind::FolderAdded,
+        &parent.id,
+        &id,
+        Some(&name),
+        None,
+    )
+    .await;
 
     let (_, parent_path) = folder_path(&state.db, &parent.id).await?;
     Ok((

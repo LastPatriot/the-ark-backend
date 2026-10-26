@@ -9,7 +9,7 @@ use tokio_util::io::ReaderStream;
 
 use crate::{
     AppState,
-    auth::{Action, Auth},
+    auth::{Action, Auth, Role},
     error::{AppError, AppResult, ErrorBody},
     storage,
 };
@@ -132,6 +132,58 @@ pub async fn download(
     }
     let body = Body::from_stream(ReaderStream::with_capacity(file.take(len), 256 * 1024));
     Ok((status, h, body).into_response())
+}
+
+/// A file's thumbnail (JPEG, longest edge 480 px). 404 until the worker has made it.
+#[utoipa::path(
+    get,
+    path = "/preview/{file_id}/{kind}",
+    tag = "downloads",
+    params(("file_id" = String, Path), ("kind" = String, Path, description = "`thumb`")),
+    security(("ark_session" = []), ("bearer" = [])),
+    responses(
+        (status = 200, description = "JPEG", content_type = "image/jpeg", body = crate::routes::uploads::BinaryBody),
+        (status = 401, body = ErrorBody),
+        (status = 403, body = ErrorBody),
+        (status = 404, description = "No preview (yet)", body = ErrorBody),
+    )
+)]
+pub async fn preview(
+    State(state): State<AppState>,
+    auth: Auth,
+    Path((file_id, kind)): Path<(String, String)>,
+) -> AppResult<Response> {
+    let row: Option<(String, Option<String>, String)> = sqlx::query_as(
+        "SELECT f.folder_id, f.session_id, p.path
+         FROM previews p JOIN files f ON f.id = p.file_id JOIN folders d ON d.id = f.folder_id
+         WHERE p.file_id = ? AND p.kind = ? AND p.status = 'ready'
+           AND f.deleted_at IS NULL AND d.archived_at IS NULL",
+    )
+    .bind(&file_id)
+    .bind(&kind)
+    .fetch_optional(&state.db)
+    .await?;
+    let (folder_id, owner, name) = row.ok_or(AppError::NotFound)?;
+    let session = auth.require(&state.db, &folder_id, Action::List).await?;
+    if session.role == Role::Uploader && owner.as_deref() != Some(session.id.as_str()) {
+        return Err(AppError::Forbidden);
+    }
+
+    let data = match tokio::fs::read(storage::preview_path(&state.cfg, &name)).await {
+        Ok(d) => d,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(AppError::NotFound),
+        Err(e) => return Err(e.into()),
+    };
+    Ok((
+        [
+            (header::CONTENT_TYPE, "image/jpeg"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            // A file id's content never changes, so neither does its preview.
+            (header::CACHE_CONTROL, "private, max-age=86400"),
+        ],
+        data,
+    )
+        .into_response())
 }
 
 /// Parses a single `bytes=` range into inclusive `(start, end)`.

@@ -25,13 +25,17 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use utoipa::ToSchema;
 
-use super::folders::resolve;
+use super::{
+    events::{EventKind, publish},
+    folders::resolve,
+};
 use crate::{
     AppState,
     auth::{Action, Auth, ancestor_chain},
     db,
     error::{AppError, AppResult, ErrorBody},
     storage, util,
+    workers::thumbnails,
 };
 
 pub const TUS_VERSION: &str = "1.0.0";
@@ -196,7 +200,7 @@ fn offset_headers(up_offset: i64, file_id: Option<&str>) -> HeaderMap {
 }
 
 /// Bytes stored in `folder_id` and below, including old versions, trash and active uploads.
-async fn usage(db: &SqlitePool, folder_id: &str) -> sqlx::Result<i64> {
+pub async fn usage(db: &SqlitePool, folder_id: &str) -> sqlx::Result<i64> {
     sqlx::query_scalar(
         "WITH RECURSIVE sub(id) AS (
              SELECT ?1 UNION ALL SELECT f.id FROM folders f JOIN sub ON f.parent_id = sub.id
@@ -703,7 +707,18 @@ async fn finalize(state: &AppState, up: &UploadRow, actor: &str) -> AppResult<St
         })),
     )
     .await?;
-    // M2: queue thumbnail job, emit SSE file_added.
+    if let Err(e) = thumbnails::queue(state, &file_id, mime.as_deref()).await {
+        tracing::error!(error = ?e, file = file_id, "queueing thumbnail");
+    }
+    publish(
+        state,
+        EventKind::FileAdded,
+        &up.folder_id,
+        &file_id,
+        Some(&up.filename),
+        Some(&up.session_id),
+    )
+    .await;
     Ok(file_id)
 }
 

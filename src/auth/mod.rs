@@ -191,7 +191,7 @@ impl Auth {
         }
         self.sessions
             .iter()
-            .find(|s| s.role == Role::Admin)
+            .find(|s| can(s.role, Action::Manage))
             .ok_or(AppError::Forbidden)
     }
 

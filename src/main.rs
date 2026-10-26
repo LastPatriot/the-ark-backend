@@ -1,11 +1,14 @@
 mod auth;
 mod config;
 mod db;
+mod discovery;
 mod error;
 mod openapi;
+mod qr;
 mod routes;
 mod storage;
 mod util;
+mod workers;
 
 use std::{
     net::SocketAddr,
@@ -22,7 +25,7 @@ use axum::{
     http::{HeaderName, HeaderValue},
     middleware::{self, Next},
     response::{IntoResponse, Redirect, Response},
-    routing::{get, head, options, patch, post},
+    routing::{delete, get, head, options, patch, post},
 };
 use axum_extra::extract::cookie::Key;
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -43,6 +46,9 @@ pub struct AppState {
     pub cookie_key: Key,
     pub setup: Arc<SetupState>,
     pub uploads: Arc<routes::uploads::UploadLocks>,
+    pub events: routes::events::Events,
+    /// Wakes the thumbnail worker.
+    pub thumbs: Arc<tokio::sync::Notify>,
 }
 
 /// First-run state: until the admin password is set only `/admin/setup` works.
@@ -78,7 +84,12 @@ async fn main() -> anyhow::Result<()> {
         cookie_key,
         setup: Arc::new(setup),
         uploads: Arc::default(),
+        events: routes::events::channel(),
+        thumbs: Arc::default(),
     };
+    workers::thumbnails::spawn(state.clone());
+    workers::trash::spawn(state.clone());
+    discovery::spawn(state.cfg.clone());
     let app = app(state.clone());
 
     let listener = tokio::net::TcpListener::bind(state.cfg.bind)
@@ -123,12 +134,21 @@ pub fn app(state: AppState) -> Router {
 
     let api = Router::new()
         .route("/me", get(routes::folders::me))
+        .route("/hub/unlock", post(routes::folders::hub_unlock))
+        .route("/folders", get(routes::folders::list_folders))
         .route("/folders/{slug}/unlock", post(routes::folders::unlock))
         .route("/folders/{slug}/items", get(routes::folders::list_items))
         .route(
             "/folders/{slug}/subfolders",
             post(routes::folders::create_subfolder),
         )
+        .route(
+            "/items/{id}",
+            patch(routes::items::update).delete(routes::items::delete),
+        )
+        .route("/items/{id}/restore", post(routes::items::restore))
+        .route("/files/{id}/versions", get(routes::items::versions))
+        .route("/events", get(routes::events::events))
         .route("/admin/setup", post(auth::admin::setup))
         .route("/admin/login", post(auth::admin::login))
         .route(
@@ -147,6 +167,23 @@ pub fn app(state: AppState) -> Router {
             "/admin/pins/{id}",
             patch(routes::admin::update_pin).delete(routes::admin::revoke_pin),
         )
+        .route(
+            "/admin/tokens",
+            get(routes::join::list_tokens).post(routes::join::create_token),
+        )
+        .route("/admin/tokens/{id}", delete(routes::join::revoke_token))
+        .route("/admin/qr", get(routes::admin_ops::qr_code))
+        .route("/admin/sessions", get(routes::admin_ops::list_sessions))
+        .route(
+            "/admin/sessions/{handle}",
+            delete(routes::admin_ops::end_session),
+        )
+        .route("/admin/activity", get(routes::admin_ops::activity))
+        .route("/admin/storage", get(routes::admin_ops::storage_report))
+        .route(
+            "/admin/trash",
+            get(routes::admin_ops::list_trash).delete(routes::admin_ops::empty_trash),
+        )
         .merge(uploads)
         .route_layer(middleware::from_fn_with_state(state.clone(), setup_gate))
         .layer(CompressionLayer::new());
@@ -155,10 +192,14 @@ pub fn app(state: AppState) -> Router {
     let mut app = Router::new()
         .route("/healthz", get(healthz))
         .route("/dl/{file_id}", get(routes::downloads::download))
+        .route("/preview/{file_id}/{kind}", get(routes::downloads::preview))
+        .route("/j/{token}", get(routes::join::join))
         .nest("/api/v1", api);
     if state.cfg.docs {
+        // Until the frontend exists, its pages lead to the API docs.
         app = app
             .route("/", get(|| async { Redirect::temporary("/docs") }))
+            .route("/f/{*path}", get(|| async { Redirect::temporary("/docs") }))
             .merge(
                 SwaggerUi::new("/docs").url("/api-docs/openapi.json", openapi::ApiDoc::openapi()),
             );
