@@ -204,15 +204,7 @@ mod tests {
     async fn checked_path_stays_inside_root() {
         let tmp = std::env::temp_dir().join(format!("ark-test-{}", crate::util::new_id()));
         std::fs::create_dir_all(tmp.join("files")).unwrap();
-        let cfg = Config {
-            bind: "127.0.0.1:0".parse().unwrap(),
-            data_dir: tmp.clone(),
-            hostname: "ark".into(),
-            session_hours: 1,
-            cookie_key: None,
-            max_chunk_mb: 1,
-            docs: false,
-        };
+        let cfg = Config::for_tests(tmp.clone());
         let ok = checked_path(&cfg, "folder1", "a.txt").await.unwrap();
         assert!(ok.ends_with("folder1/a.txt"));
         assert!(checked_path(&cfg, "..", "a.txt").await.is_err());

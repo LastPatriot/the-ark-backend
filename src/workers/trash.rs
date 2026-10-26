@@ -51,7 +51,7 @@ pub async fn purge(state: &AppState, before: Option<&str>) -> anyhow::Result<u64
             remove_if_exists(&storage::preview_path(&state.cfg, &p)).await?;
         }
 
-        let mut tx = state.db.begin().await?;
+        let mut tx = db::begin_write(&state.db).await?;
         sqlx::query("DELETE FROM previews WHERE file_id = ?")
             .bind(&id)
             .execute(&mut *tx)

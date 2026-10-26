@@ -244,7 +244,7 @@ pub async fn update_folder(
         None => current.archived_at.clone(),
     };
 
-    let mut tx = state.db.begin().await?;
+    let mut tx = db::begin_write(&state.db).await?;
     if slug != current.slug {
         sqlx::query(
             "INSERT INTO folder_slug_history (old_slug, parent_id, folder_id) VALUES (?, NULL, ?)
@@ -589,7 +589,7 @@ pub async fn revoke_pin(
     let admin = auth.admin()?;
     load_pin(&state, &id).await?;
     let now = util::now();
-    let mut tx = state.db.begin().await?;
+    let mut tx = db::begin_write(&state.db).await?;
     sqlx::query("UPDATE pins SET revoked_at = COALESCE(revoked_at, ?) WHERE id = ?")
         .bind(&now)
         .bind(&id)

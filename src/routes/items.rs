@@ -323,7 +323,7 @@ async fn move_family(
     }
 
     let result = async {
-        let mut tx = state.db.begin().await?;
+        let mut tx = db::begin_write(&state.db).await?;
         for row in &family {
             let disk_name = moved
                 .iter()
@@ -398,7 +398,7 @@ async fn update_folder(
         }
     }
 
-    let mut tx = state.db.begin().await?;
+    let mut tx = db::begin_write(&state.db).await?;
     if slug != folder.slug || new_parent != parent {
         sqlx::query(
             "INSERT INTO folder_slug_history (old_slug, parent_id, folder_id) VALUES (?, ?, ?)
@@ -605,7 +605,7 @@ pub async fn restore(
         .require(&state.db, &file.folder_id, Action::Trash)
         .await?;
 
-    let mut tx = state.db.begin().await?;
+    let mut tx = db::begin_write(&state.db).await?;
     let was_trashed = file.deleted_at.is_some();
     if let Some(deleted_at) = &file.deleted_at {
         // Everything trashed together with this file comes back together.

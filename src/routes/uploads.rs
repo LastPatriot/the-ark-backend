@@ -374,11 +374,12 @@ pub async fn head(
     auth: Auth,
     Path(id): Path<String>,
 ) -> AppResult<Response> {
-    load_owned(&state, &auth, &id).await?;
+    let (_, actor) = load_owned(&state, &auth, &id).await?;
     let _guard = state.uploads.acquire(&id).await;
     let up = load_upload(&state.db, &id)
         .await?
         .ok_or(AppError::NotFound)?;
+    let up = finish_if_received(&state, up, &actor).await?;
     let mut h = offset_headers(up.offset, up.file_id.as_deref());
     h.insert("upload-length", HeaderValue::from(up.size));
     Ok((StatusCode::OK, h).into_response())
@@ -446,6 +447,7 @@ pub async fn patch(
     let up = load_upload(&state.db, &id)
         .await?
         .ok_or(AppError::NotFound)?;
+    let up = finish_if_received(&state, up, &actor).await?;
 
     if up.status == "complete" && client_offset == up.size {
         return Ok((
@@ -538,6 +540,21 @@ pub async fn patch(
         .into_response())
 }
 
+/// All bytes arrived but finalizing failed earlier (e.g. disk or database error):
+/// finalize now, so the client's next HEAD/PATCH gets its file.
+async fn finish_if_received(state: &AppState, up: UploadRow, actor: &str) -> AppResult<UploadRow> {
+    if up.status != "active" || up.offset != up.size {
+        return Ok(up);
+    }
+    let file_id = finalize(state, &up, actor).await?;
+    state.uploads.forget(&up.id);
+    Ok(UploadRow {
+        status: "complete".into(),
+        file_id: Some(file_id),
+        ..up
+    })
+}
+
 fn too_long(allowed: u64) -> AppError {
     AppError::Status(
         StatusCode::PAYLOAD_TOO_LARGE,
@@ -617,8 +634,9 @@ async fn finalize(state: &AppState, up: &UploadRow, actor: &str) -> AppResult<St
     .fetch_optional(&state.db)
     .await?;
     if let Some(file_id) = existing {
-        tokio::fs::remove_file(&part).await?;
+        // Record completion first: if removing the data fails, the upload is still done.
         mark_complete(&state.db, &up.id, &file_id).await?;
+        tokio::fs::remove_file(&part).await?;
         tracing::info!(
             upload = up.id,
             file = file_id,
@@ -632,7 +650,7 @@ async fn finalize(state: &AppState, up: &UploadRow, actor: &str) -> AppResult<St
         .fetch_one(&state.db)
         .await?;
     let file_id = util::new_id();
-    let mut tx = state.db.begin().await?;
+    let mut tx = db::begin_write(&state.db).await?;
 
     // Versions count every row with the name, trashed ones too, so disk names never repeat.
     let prev: Option<i64> = sqlx::query_scalar(

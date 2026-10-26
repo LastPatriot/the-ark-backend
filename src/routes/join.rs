@@ -205,7 +205,7 @@ pub async fn revoke_token(
 ) -> AppResult<StatusCode> {
     let admin = auth.admin()?;
     let now = util::now();
-    let mut tx = state.db.begin().await?;
+    let mut tx = db::begin_write(&state.db).await?;
     let found =
         sqlx::query("UPDATE join_tokens SET revoked_at = COALESCE(revoked_at, ?) WHERE id = ?")
             .bind(&now)

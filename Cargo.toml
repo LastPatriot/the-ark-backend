@@ -12,6 +12,7 @@ base64 = "0.23.1"
 chrono = { version = "0.4.45", features = ["serde"] }
 fs4 = "1.1.0"
 futures-util = "0.3.34"
+hickory-proto = "0.26.3"
 if-addrs = "0.15.0"
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
 mdns-sd = "0.21.6"
@@ -34,3 +35,7 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 utoipa = { version = "6.0.0", features = ["axum_extras", "uuid", "chrono"] }
 utoipa-swagger-ui = { version = "10.0.2", features = ["axum"] }
 uuid = { version = "1.29.0", features = ["v7", "serde"] }
+
+[dev-dependencies]
+http-body-util = "0.1.5"
+tower = { version = "0.5.3", features = ["util"] }

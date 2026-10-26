@@ -1,0 +1,28 @@
+[Unit]
+Description=Ark shared media drive
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ark
+Group=ark
+EnvironmentFile=-/etc/ark/ark.env
+WorkingDirectory=/var/lib/ark
+ExecStart=/usr/local/bin/ark
+Restart=always
+RestartSec=2
+# Ports 80 (HTTP) and 53 (local DNS) without running as root.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/ark
+# AF_NETLINK: interface addresses for the mDNS/DNS IP watcher.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

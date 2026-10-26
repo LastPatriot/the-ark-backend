@@ -31,6 +31,15 @@ pub async fn connect(data_dir: &Path) -> anyhow::Result<SqlitePool> {
     Ok(pool)
 }
 
+/// Starts a write transaction. `BEGIN IMMEDIATE` takes the write lock up front, so a
+/// transaction that reads before it writes waits for the lock (busy_timeout) instead
+/// of failing with "database is locked" when another writer got there first.
+pub async fn begin_write(
+    db: &SqlitePool,
+) -> sqlx::Result<sqlx::Transaction<'static, sqlx::Sqlite>> {
+    db.begin_with("BEGIN IMMEDIATE").await
+}
+
 pub async fn get_setting(db: &SqlitePool, key: &str) -> sqlx::Result<Option<String>> {
     sqlx::query_scalar("SELECT value FROM settings WHERE key = ?")
         .bind(key)

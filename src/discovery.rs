@@ -68,7 +68,7 @@ pub fn spawn(cfg: Arc<Config>) {
 }
 
 /// Non-loopback, non-link-local IPv4 addresses of interfaces that are up, sorted.
-fn lan_ipv4s() -> Vec<IpAddr> {
+pub fn lan_ipv4s() -> Vec<IpAddr> {
     let mut ips: Vec<IpAddr> = if_addrs::get_if_addrs()
         .unwrap_or_default()
         .into_iter()

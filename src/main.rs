@@ -2,15 +2,19 @@ mod auth;
 mod config;
 mod db;
 mod discovery;
+mod dns;
 mod error;
 mod openapi;
 mod qr;
 mod routes;
 mod storage;
+#[cfg(test)]
+mod tests;
 mod util;
 mod workers;
 
 use std::{
+    io::IsTerminal,
     net::SocketAddr,
     sync::{
         Arc, Mutex,
@@ -71,25 +75,15 @@ async fn main() -> anyhow::Result<()> {
             EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| EnvFilter::new("the_ark=info,tower_http=info")),
         )
+        // journald and the Windows log file get plain text.
+        .with_ansi(std::io::stdout().is_terminal())
         .init();
 
-    let cfg = Config::load()?;
-    let db = db::connect(&cfg.data_dir).await?;
-    let cookie_key = load_cookie_key(&db, &cfg).await?;
-    let setup = load_setup_state(&db).await?;
-
-    let state = AppState {
-        db,
-        cfg: Arc::new(cfg),
-        cookie_key,
-        setup: Arc::new(setup),
-        uploads: Arc::default(),
-        events: routes::events::channel(),
-        thumbs: Arc::default(),
-    };
+    let state = build_state(Config::load()?).await?;
     workers::thumbnails::spawn(state.clone());
     workers::trash::spawn(state.clone());
     discovery::spawn(state.cfg.clone());
+    dns::spawn(state.cfg.clone());
     let app = app(state.clone());
 
     let listener = tokio::net::TcpListener::bind(state.cfg.bind)
@@ -107,12 +101,46 @@ async fn main() -> anyhow::Result<()> {
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(async {
-        let _ = tokio::signal::ctrl_c().await;
-        tracing::info!("shutting down");
-    })
+    .with_graceful_shutdown(shutdown_signal())
     .await?;
     Ok(())
+}
+
+/// Ctrl-C, or SIGTERM from systemd.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    let term = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(_) => std::future::pending().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let term = std::future::pending::<()>();
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = term => {}
+    }
+    tracing::info!("shutting down");
+}
+
+/// Opens the database and loads keys and setup state. Background tasks are started
+/// separately.
+pub async fn build_state(cfg: Config) -> anyhow::Result<AppState> {
+    let db = db::connect(&cfg.data_dir).await?;
+    let cookie_key = load_cookie_key(&db, &cfg).await?;
+    let setup = load_setup_state(&db).await?;
+    Ok(AppState {
+        db,
+        cfg: Arc::new(cfg),
+        cookie_key,
+        setup: Arc::new(setup),
+        uploads: Arc::default(),
+        events: routes::events::channel(),
+        thumbs: Arc::default(),
+    })
 }
 
 pub fn app(state: AppState) -> Router {
