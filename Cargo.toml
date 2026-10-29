@@ -10,6 +10,7 @@ async_zip = { version = "0.0.19", features = ["tokio"] }
 axum = { version = "0.8.9", features = ["macros"] }
 axum-extra = { version = "0.12.6", features = ["cookie-signed"] }
 base64 = "0.23.1"
+chacha20poly1305 = "0.10.1"
 chrono = { version = "0.4.45", features = ["serde"] }
 fs4 = "1.1.0"
 futures-util = { version = "0.3.34", features = ["io"] }

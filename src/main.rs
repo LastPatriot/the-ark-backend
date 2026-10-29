@@ -12,6 +12,7 @@ mod storage;
 mod tests;
 mod tunnel;
 mod util;
+mod vault;
 mod workers;
 
 use std::{
@@ -49,6 +50,7 @@ pub struct AppState {
     pub db: SqlitePool,
     pub cfg: Arc<Config>,
     pub cookie_key: Key,
+    pub vault: Arc<vault::Vault>,
     pub setup: Arc<SetupState>,
     pub uploads: Arc<routes::uploads::UploadLocks>,
     pub events: routes::events::Events,
@@ -142,11 +144,13 @@ async fn shutdown_signal() {
 pub async fn build_state(cfg: Config) -> anyhow::Result<AppState> {
     let db = db::connect(&cfg.data_dir).await?;
     let cookie_key = load_cookie_key(&db, &cfg).await?;
+    let vault = Arc::new(vault::Vault::load(&cfg)?);
     let setup = load_setup_state(&db).await?;
     Ok(AppState {
         db,
         cfg: Arc::new(cfg),
         cookie_key,
+        vault,
         setup: Arc::new(setup),
         uploads: Arc::default(),
         events: routes::events::channel(),
@@ -177,6 +181,7 @@ pub fn app(state: AppState) -> Router {
 
     let api = Router::new()
         .route("/me", get(routes::folders::me))
+        .route("/logout", post(routes::folders::logout))
         .route("/hub/unlock", post(routes::folders::hub_unlock))
         .route("/folders", get(routes::folders::list_folders))
         .route("/folders/{slug}/unlock", post(routes::folders::unlock))

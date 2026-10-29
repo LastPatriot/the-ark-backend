@@ -54,7 +54,7 @@ pub struct CreateFolderRequest {
     pub slug: Option<String>,
     #[serde(default)]
     pub is_open: bool,
-    /// Required when `is_open`; one of viewer, uploader, contributor, editor.
+    /// Required when `is_open`; one of viewer, uploader, guest, contributor, editor.
     pub default_role: Option<Role>,
     pub storage_limit: Option<i64>,
 }
@@ -90,7 +90,7 @@ fn check_open_role(is_open: bool, role: Option<Role>) -> AppResult<()> {
     match role {
         Some(r) if !r.is_folder_role() => Err(AppError::bad_request(
             "invalid_role",
-            "default_role must be viewer, uploader, contributor or editor",
+            "default_role must be viewer, uploader, guest, contributor or editor",
         )),
         None if is_open => Err(AppError::bad_request(
             "default_role_required",
@@ -315,10 +315,17 @@ pub async fn archive_folder(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// A PIN as the admin sees it. The PIN itself is never returned after creation.
+/// A PIN as the admin sees it.
 #[derive(Debug, Serialize, ToSchema, sqlx::FromRow)]
 pub struct AdminPin {
     pub id: String,
+    /// The PIN digits. Null for revoked PINs and for PINs created before Ark kept them
+    /// (revoke and recreate those to see them).
+    #[sqlx(skip)]
+    #[schema(example = "2468")]
+    pub pin: Option<String>,
+    #[serde(skip)]
+    pub pin_sealed: Option<String>,
     /// Null for the hub PIN.
     pub folder_id: Option<String>,
     pub label: String,
@@ -331,7 +338,18 @@ pub struct AdminPin {
 }
 
 const PIN_COLUMNS: &str =
-    "id, folder_id, label, role, expires_at, max_uses, uses, revoked_at, created_at";
+    "id, folder_id, label, role, expires_at, max_uses, uses, revoked_at, created_at, pin_sealed";
+
+/// Fills in the PIN digits for the admin.
+fn reveal(state: &AppState, mut p: AdminPin) -> AdminPin {
+    if p.revoked_at.is_none() {
+        p.pin = p
+            .pin_sealed
+            .as_deref()
+            .and_then(|sealed| state.vault.open(&p.id, sealed));
+    }
+    p
+}
 
 #[derive(Debug, Deserialize, IntoParams)]
 pub struct PinsQuery {
@@ -351,7 +369,7 @@ pub struct CreatePinRequest {
     /// 4–8 digits.
     #[schema(example = "2468")]
     pub pin: String,
-    /// viewer, uploader, contributor or editor for folder PINs; hub for the hub PIN.
+    /// viewer, uploader, guest, contributor or editor for folder PINs; hub for the hub PIN.
     pub role: Role,
     /// RFC 3339.
     pub expires_at: Option<String>,
@@ -370,13 +388,14 @@ pub struct UpdatePinRequest {
 }
 
 async fn load_pin(state: &AppState, id: &str) -> AppResult<AdminPin> {
-    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+    let pin = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT {PIN_COLUMNS} FROM pins WHERE id = ?"
     )))
     .bind(id)
     .fetch_optional(&state.db)
     .await?
-    .ok_or(AppError::NotFound)
+    .ok_or(AppError::NotFound)?;
+    Ok(reveal(state, pin))
 }
 
 fn parse_expiry(s: Option<String>) -> AppResult<Option<String>> {
@@ -405,7 +424,7 @@ pub async fn list_pins(
     Query(q): Query<PinsQuery>,
 ) -> AppResult<Json<Vec<AdminPin>>> {
     auth.admin()?;
-    let pins = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+    let pins: Vec<AdminPin> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT {PIN_COLUMNS} FROM pins
          WHERE (?1 IS NULL OR folder_id = ?1) AND (?2 OR revoked_at IS NULL)
          ORDER BY created_at"
@@ -414,7 +433,7 @@ pub async fn list_pins(
     .bind(q.include_revoked)
     .fetch_all(&state.db)
     .await?;
-    Ok(Json(pins))
+    Ok(Json(pins.into_iter().map(|p| reveal(&state, p)).collect()))
 }
 
 /// Create a folder PIN or the hub PIN.
@@ -451,7 +470,7 @@ pub async fn create_pin(
         (Some(_), r) if !r.is_folder_role() => {
             return Err(AppError::bad_request(
                 "invalid_role",
-                "Folder PINs take viewer, uploader, contributor or editor",
+                "Folder PINs take viewer, uploader, guest, contributor or editor",
             ));
         }
         (Some(folder_id), _) => {
@@ -486,10 +505,11 @@ pub async fn create_pin(
     }
 
     let id = util::new_id();
+    let sealed = state.vault.seal(&id, &req.pin);
     let hash = pin::hash_secret(req.pin).await?;
     sqlx::query(
-        "INSERT INTO pins (id, folder_id, label, pin_hash, role, expires_at, max_uses, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO pins (id, folder_id, label, pin_hash, role, expires_at, max_uses, created_at, pin_sealed)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(&req.folder_id)
@@ -499,6 +519,7 @@ pub async fn create_pin(
     .bind(&expires_at)
     .bind(req.max_uses)
     .bind(&now)
+    .bind(sealed)
     .execute(&state.db)
     .await?;
     db::audit(

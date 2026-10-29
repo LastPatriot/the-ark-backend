@@ -23,7 +23,7 @@ use crate::{
 pub struct AdminToken {
     pub id: String,
     pub folder_id: String,
-    /// viewer or uploader.
+    /// viewer, uploader, guest or contributor.
     pub role: Role,
     pub label: String,
     pub expires_at: Option<String>,
@@ -31,23 +31,27 @@ pub struct AdminToken {
     pub uses: i64,
     pub revoked_at: Option<String>,
     pub created_at: String,
+    /// Join link to put in a QR code (`GET /api/v1/admin/qr?url=...`). Null for revoked
+    /// links and for links created before Ark kept them (revoke and recreate those).
+    #[sqlx(skip)]
+    #[schema(example = "http://ark.local/j/q8V0mJ2l3g8m0r5Yp1xZ7w")]
+    pub url: Option<String>,
+    #[serde(skip)]
+    pub token_sealed: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct CreatedToken {
     #[serde(flatten)]
     pub token: AdminToken,
-    /// The raw token. Shown only in this response.
+    /// The raw token (the last part of `url`).
     pub secret: String,
-    /// Join link to put in a QR code (`GET /api/v1/admin/qr?url=...`).
-    #[schema(example = "http://ark.local/j/q8V0mJ2l3g8m0r5Yp1xZ7w")]
-    pub url: String,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateTokenRequest {
     pub folder_id: String,
-    /// viewer or uploader.
+    /// viewer, uploader, guest or contributor.
     pub role: Role,
     #[schema(example = "Entrance poster")]
     pub label: String,
@@ -64,7 +68,23 @@ pub struct TokensQuery {
 }
 
 const TOKEN_COLUMNS: &str =
-    "id, folder_id, role, label, expires_at, max_uses, uses, revoked_at, created_at";
+    "id, folder_id, role, label, expires_at, max_uses, uses, revoked_at, created_at, token_sealed";
+
+fn join_url(state: &AppState, secret: &str) -> String {
+    format!("{}/j/{secret}", qr::public_base(&state.cfg))
+}
+
+/// Fills in the join link for the admin.
+fn reveal(state: &AppState, mut t: AdminToken) -> AdminToken {
+    if t.revoked_at.is_none() {
+        t.url = t
+            .token_sealed
+            .as_deref()
+            .and_then(|sealed| state.vault.open(&t.id, sealed))
+            .map(|secret| join_url(state, &secret));
+    }
+    t
+}
 
 #[utoipa::path(
     get,
@@ -84,7 +104,7 @@ pub async fn list_tokens(
     Query(q): Query<TokensQuery>,
 ) -> AppResult<Json<Vec<AdminToken>>> {
     auth.admin()?;
-    let rows = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+    let rows: Vec<AdminToken> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT {TOKEN_COLUMNS} FROM join_tokens
          WHERE (?1 IS NULL OR folder_id = ?1) AND (?2 OR revoked_at IS NULL)
          ORDER BY created_at"
@@ -93,10 +113,10 @@ pub async fn list_tokens(
     .bind(q.include_revoked)
     .fetch_all(&state.db)
     .await?;
-    Ok(Json(rows))
+    Ok(Json(rows.into_iter().map(|t| reveal(&state, t)).collect()))
 }
 
-/// Create a join token. The raw token and its link are returned once.
+/// Create a join token. Its link stays available from `GET /api/v1/admin/tokens`.
 #[utoipa::path(
     post,
     path = "/api/v1/admin/tokens",
@@ -117,10 +137,13 @@ pub async fn create_token(
     Json(req): Json<CreateTokenRequest>,
 ) -> AppResult<(StatusCode, Json<CreatedToken>)> {
     let admin = auth.admin()?;
-    if !matches!(req.role, Role::Viewer | Role::Uploader) {
+    if !matches!(
+        req.role,
+        Role::Viewer | Role::Uploader | Role::Guest | Role::Contributor
+    ) {
         return Err(AppError::bad_request(
             "invalid_role",
-            "Join tokens are viewer or uploader",
+            "Join tokens are viewer, uploader, guest or contributor",
         ));
     }
     let label = req.label.trim().to_string();
@@ -144,8 +167,8 @@ pub async fn create_token(
     let id = util::new_id();
     let secret = util::random_token();
     sqlx::query(
-        "INSERT INTO join_tokens (id, folder_id, token_hash, role, label, expires_at, max_uses, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO join_tokens (id, folder_id, token_hash, role, label, expires_at, max_uses, created_at, token_sealed)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(&req.folder_id)
@@ -155,6 +178,7 @@ pub async fn create_token(
     .bind(&expires_at)
     .bind(req.max_uses)
     .bind(util::now())
+    .bind(state.vault.seal(&id, &secret))
     .execute(&state.db)
     .await?;
     db::audit(
@@ -177,8 +201,7 @@ pub async fn create_token(
     Ok((
         StatusCode::CREATED,
         Json(CreatedToken {
-            token,
-            url: format!("{}/j/{secret}", qr::public_base(&state.cfg)),
+            token: reveal(&state, token),
             secret,
         }),
     ))

@@ -25,6 +25,8 @@ pub const COOKIE_PREFIX: &str = "ark_s_";
 pub enum Role {
     Viewer,
     Uploader,
+    /// View, download and upload; no subfolders, no changes. The usual guest QR.
+    Guest,
     Contributor,
     Editor,
     Hub,
@@ -33,9 +35,10 @@ pub enum Role {
 
 impl Role {
     #[cfg(test)]
-    pub const ALL: [Role; 6] = [
+    pub const ALL: [Role; 7] = [
         Role::Viewer,
         Role::Uploader,
+        Role::Guest,
         Role::Contributor,
         Role::Editor,
         Role::Hub,
@@ -51,20 +54,21 @@ impl Role {
     pub fn is_folder_role(self) -> bool {
         matches!(
             self,
-            Role::Viewer | Role::Uploader | Role::Contributor | Role::Editor
+            Role::Viewer | Role::Uploader | Role::Guest | Role::Contributor | Role::Editor
         )
     }
 
-    /// Preference when several sessions allow the same action. Viewer outranks uploader
-    /// so a device holding both sees the full listing instead of only its own uploads.
+    /// Tie-break when several sessions are equally close, e.g. a bearer token and a
+    /// cookie for the same folder.
     fn rank(self) -> u8 {
         match self {
             Role::Uploader => 0,
             Role::Viewer => 1,
-            Role::Contributor => 2,
-            Role::Editor => 3,
-            Role::Hub => 4,
-            Role::Admin => 5,
+            Role::Guest => 2,
+            Role::Contributor => 3,
+            Role::Editor => 4,
+            Role::Hub => 5,
+            Role::Admin => 6,
         }
     }
 }
@@ -97,6 +101,7 @@ pub fn can(role: Role, action: Action) -> bool {
         (_, SeeHub) => false,
         (Viewer, List | Download) => true,
         (Uploader, List | Upload) => true,
+        (Guest, List | Download | Upload) => true,
         (Contributor, List | Download | Upload | CreateSubfolder) => true,
         (Editor, _) => true,
         _ => false,
@@ -224,8 +229,27 @@ impl Auth {
             .ok_or(AppError::Forbidden)
     }
 
-    /// Returns the best session allowed to perform `action` on `folder_id`: its role must
-    /// allow the action and the folder must be its root or a descendant of it.
+    /// The folder session for the folder whose ancestor chain is `chain`: the one rooted
+    /// closest to it. Hub and admin sessions are never folder sessions.
+    pub fn folder_session(&self, chain: &[String]) -> Option<&Session> {
+        self.sessions
+            .iter()
+            .filter(|s| !s.role.is_unrestricted())
+            .filter_map(|s| {
+                let depth = chain
+                    .iter()
+                    .position(|c| Some(c) == s.root_folder.as_ref())?;
+                Some((depth, s))
+            })
+            .min_by_key(|(depth, s)| (*depth, std::cmp::Reverse(s.role.rank())))
+            .map(|(_, s)| s)
+    }
+
+    /// Returns the one session that decides what this browser may do in `folder_id`, if
+    /// its role allows `action`. That is the folder session rooted closest to the folder,
+    /// or, when no folder session covers it, the hub or admin session. Sessions never
+    /// combine: a viewer PIN on a folder plus an uploader QR on a subfolder make the
+    /// subfolder upload-only until that session ends.
     pub async fn require(
         &self,
         db: &SqlitePool,
@@ -236,14 +260,14 @@ impl Auth {
             return Err(AppError::unauthorized());
         }
         let chain = ancestor_chain(db, folder_id).await?;
-        self.sessions
-            .iter()
-            .filter(|s| can(s.role, action))
-            .filter(|s| {
-                s.role.is_unrestricted()
-                    || s.root_folder.as_ref().is_some_and(|r| chain.contains(r))
+        self.folder_session(&chain)
+            .or_else(|| {
+                self.sessions
+                    .iter()
+                    .filter(|s| s.role.is_unrestricted())
+                    .max_by_key(|s| s.role.rank())
             })
-            .max_by_key(|s| s.role.rank())
+            .filter(|s| can(s.role, action))
             .ok_or(AppError::Forbidden)
     }
 }
@@ -308,7 +332,19 @@ pub async fn create_session(
     .execute(&state.db)
     .await?;
 
-    let cookie = Cookie::build((cookie_name(new.role, new.root_folder), id.clone()))
+    // The new cookie replaces whatever this browser held under the same name (e.g. the
+    // viewer PIN for a folder it now unlocks as contributor); end that session too
+    // instead of leaving it valid behind the cookie.
+    let name = cookie_name(new.role, new.root_folder);
+    for old in auth
+        .sessions
+        .iter()
+        .filter(|s| cookie_name(s.role, s.root_folder.as_deref()) == name)
+    {
+        end_session(&state.db, &old.id).await?;
+    }
+
+    let cookie = Cookie::build((name, id.clone()))
         .path("/")
         .http_only(true)
         .same_site(SameSite::Lax)
@@ -318,6 +354,22 @@ pub async fn create_session(
     Ok((id, cookie))
 }
 
+pub async fn end_session(db: &SqlitePool, id: &str) -> sqlx::Result<()> {
+    sqlx::query("UPDATE sessions SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL")
+        .bind(util::now())
+        .bind(id)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+/// Expires the cookie that carries `session` in the browser.
+pub fn removal_cookie(session: &Session) -> Cookie<'static> {
+    Cookie::build(cookie_name(session.role, session.root_folder.as_deref()))
+        .path("/")
+        .build()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -325,16 +377,19 @@ mod tests {
     use Role::*;
 
     /// One row per action, columns in `Role::ALL` order:
-    /// viewer, uploader, contributor, editor, hub, admin.
-    const MATRIX: [(Action, [bool; 6]); 8] = [
-        (List, [true, true, true, true, true, true]),
-        (Download, [true, false, true, true, true, true]),
-        (Upload, [false, true, true, true, true, true]),
-        (CreateSubfolder, [false, false, true, true, true, true]),
-        (Modify, [false, false, false, true, true, true]),
-        (Trash, [false, false, false, true, true, true]),
-        (SeeHub, [false, false, false, false, true, true]),
-        (Manage, [false, false, false, false, false, true]),
+    /// viewer, uploader, guest, contributor, editor, hub, admin.
+    const MATRIX: [(Action, [bool; 7]); 8] = [
+        (List, [true, true, true, true, true, true, true]),
+        (Download, [true, false, true, true, true, true, true]),
+        (Upload, [false, true, true, true, true, true, true]),
+        (
+            CreateSubfolder,
+            [false, false, false, true, true, true, true],
+        ),
+        (Modify, [false, false, false, false, true, true, true]),
+        (Trash, [false, false, false, false, true, true, true]),
+        (SeeHub, [false, false, false, false, false, true, true]),
+        (Manage, [false, false, false, false, false, false, true]),
     ];
 
     #[test]

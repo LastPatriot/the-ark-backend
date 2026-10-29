@@ -139,11 +139,7 @@ pub async fn end_session(
         .into_iter()
         .find(|s| handle(&s.id) == h)
         .ok_or(AppError::NotFound)?;
-    sqlx::query("UPDATE sessions SET revoked_at = ? WHERE id = ?")
-        .bind(util::now())
-        .bind(&session.id)
-        .execute(&state.db)
-        .await?;
+    crate::auth::end_session(&state.db, &session.id).await?;
     db::audit(
         &state.db,
         &admin.actor,

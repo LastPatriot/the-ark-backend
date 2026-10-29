@@ -19,6 +19,7 @@ use crate::{auth, error, routes};
         auth::admin::setup,
         auth::admin::login,
         routes::folders::me,
+        routes::folders::logout,
         routes::folders::hub_unlock,
         routes::folders::unlock,
         routes::join::join,

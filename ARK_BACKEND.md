@@ -243,16 +243,16 @@ CREATE TABLE audit_log (
 
 ### Roles and permissions
 
-| Operation | viewer | uploader | contributor | editor | hub | admin |
-| --- | --- | --- | --- | --- | --- | --- |
-| List folder / previews | yes | own uploads only | yes | yes | yes | yes |
-| Download | yes | no | yes | yes | yes | yes |
-| Upload | no | yes | yes | yes | yes | yes |
-| Create subfolder | no | no | yes | yes | yes | yes |
-| Rename / move / tag | no | no | no | yes | yes | yes |
-| Delete to trash / restore | no | no | no | yes | yes | yes |
-| See home page folder list | no | no | no | no | yes | yes |
-| Create top-level folders, PINs, QR, settings | no | no | no | no | no | yes |
+| Operation | viewer | uploader | guest | contributor | editor | hub | admin |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| List folder / previews | yes | own uploads only | yes | yes | yes | yes | yes |
+| Download | yes | no | yes | yes | yes | yes | yes |
+| Upload | no | yes | yes | yes | yes | yes | yes |
+| Create subfolder | no | no | no | yes | yes | yes | yes |
+| Rename / move / tag | no | no | no | no | yes | yes | yes |
+| Delete to trash / restore | no | no | no | no | yes | yes | yes |
+| See home page folder list | no | no | no | no | no | yes | yes |
+| Create top-level folders, PINs, QR, settings | no | no | no | no | no | no | yes |
 
 Implement as `fn can(role: Role, action: Action) -> bool` with one match table, plus a
 unit test per cell.
@@ -268,6 +268,11 @@ Every session has a `root_folder`. A request on folder `F` is allowed only if `F
 - A subfolder PIN never grants access to its parent.
 - Hub and admin sessions have no root restriction.
 - One browser can hold several sessions (one cookie per folder: `ark_s_<folder_id_prefix>`).
+  They never combine: in folder `F` only the session rooted closest to `F` counts (hub
+  and admin only where no folder session covers `F`). Unlocking a folder again ends the
+  session it replaces; `POST /api/v1/logout` ends one or all.
+- PINs and join-token secrets are also stored encrypted (key in `<data_dir>/secret.key`)
+  so the admin can look them up; the hashes still do the checking.
 
 ### PIN handling
 

@@ -64,6 +64,13 @@ Check with `sudo ss -lunp 'sport = :53'` / `Get-NetUDPEndpoint -LocalPort 53`.
   dashboard. It restarts with Ark until `DELETE /api/v1/admin/tunnel`. Anyone on the
   internet can then reach the PIN pages, so use 6+ digit PINs and consider `ARK_DOCS=false`.
 
+## Backups
+
+Back up the whole data directory (`/var/lib/ark`, `C:\ProgramData\Ark\data`), or at least
+`ark.db` together with `secret.key`. The key decrypts the PINs and join links the admin
+can look up; without it Ark still works and still checks PINs, but shows saved PINs and
+links as unavailable until they are recreated. Keep the key out of shared or cloud folders.
+
 ## Checks before the demo
 
 ```bash

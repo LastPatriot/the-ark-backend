@@ -12,6 +12,9 @@ pub struct Config {
     pub session_hours: i64,
     /// Base64 (standard) encoding of at least 64 bytes. Generated and stored in the DB when unset.
     pub cookie_key: Option<String>,
+    /// Base64 (standard) of 32 bytes; encrypts stored PINs and join links so the admin
+    /// can see them again. Generated into `<data_dir>/secret.key` when unset.
+    pub secret_key: Option<String>,
     pub max_chunk_mb: u64,
     pub docs: bool,
     /// Run the local DNS server (answers `<hostname>` and `<hostname>.local`).
@@ -40,6 +43,7 @@ struct FileConfig {
     hostname: Option<String>,
     session_hours: Option<i64>,
     cookie_key: Option<String>,
+    secret_key: Option<String>,
     max_chunk_mb: Option<u64>,
     docs: Option<bool>,
     dns: Option<bool>,
@@ -94,6 +98,7 @@ impl Config {
                 .or(file.session_hours)
                 .unwrap_or(12),
             cookie_key: env("ARK_COOKIE_KEY").or(file.cookie_key),
+            secret_key: env("ARK_SECRET_KEY").or(file.secret_key),
             max_chunk_mb: parse_env("ARK_MAX_CHUNK_MB")?
                 .or(file.max_chunk_mb)
                 .unwrap_or(16),
@@ -127,6 +132,7 @@ impl Config {
             hostname: "ark".into(),
             session_hours: 1,
             cookie_key: None,
+            secret_key: None,
             max_chunk_mb: 1,
             docs: false,
             dns: false,

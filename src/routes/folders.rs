@@ -11,7 +11,8 @@ use utoipa::{IntoParams, ToSchema};
 use crate::{
     AppState,
     auth::{
-        Action, Auth, NewSession, Role, admin::SessionResponse, ancestor_chain, create_session, pin,
+        Action, Auth, NewSession, Role, Session, admin::SessionResponse, ancestor_chain,
+        create_session, end_session, pin, removal_cookie,
     },
     db,
     error::{AppError, AppResult, ErrorBody, is_unique_violation},
@@ -603,4 +604,81 @@ pub async fn me(State(state): State<AppState>, auth: Auth) -> AppResult<Json<MeR
         hub: has(Role::Hub) || has(Role::Admin),
         admin: has(Role::Admin),
     }))
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct LogoutRequest {
+    /// End the folder session that applies in this folder: the one rooted at it, or at
+    /// its nearest ancestor that has one. Use a `folder_id` from `GET /api/v1/me` or
+    /// the current folder.
+    pub folder_id: Option<String>,
+    /// `hub` or `admin`: end that session.
+    pub role: Option<Role>,
+    /// End every session this browser holds.
+    #[serde(default)]
+    pub all: bool,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct LogoutResponse {
+    /// Sessions ended; 0 when there was nothing to end.
+    pub ended: usize,
+}
+
+/// End sessions on this browser and clear their cookies. Give exactly one of
+/// `folder_id`, `role` or `all`. Afterwards the folder asks for a PIN again, and live
+/// event streams of the ended sessions close.
+#[utoipa::path(
+    post,
+    path = "/api/v1/logout",
+    tag = "auth",
+    request_body = LogoutRequest,
+    security((), ("ark_session" = []), ("bearer" = [])),
+    responses(
+        (status = 200, description = "Ended; cookies cleared", body = LogoutResponse),
+        (status = 400, description = "Not exactly one of folder_id, role, all", body = ErrorBody),
+    )
+)]
+pub async fn logout(
+    State(state): State<AppState>,
+    auth: Auth,
+    jar: SignedCookieJar,
+    Json(req): Json<LogoutRequest>,
+) -> AppResult<(SignedCookieJar, Json<LogoutResponse>)> {
+    let targets: Vec<&Session> = match (&req.folder_id, req.role, req.all) {
+        (Some(folder_id), None, false) => {
+            let chain = ancestor_chain(&state.db, folder_id).await?;
+            auth.folder_session(&chain).into_iter().collect()
+        }
+        (None, Some(role @ (Role::Hub | Role::Admin)), false) => {
+            auth.sessions.iter().filter(|s| s.role == role).collect()
+        }
+        (None, None, true) => auth.sessions.iter().collect(),
+        _ => {
+            return Err(AppError::bad_request(
+                "invalid_logout",
+                "Give exactly one of folder_id, role (hub or admin) or all",
+            ));
+        }
+    };
+
+    let mut jar = jar;
+    for s in &targets {
+        end_session(&state.db, &s.id).await?;
+        db::audit(
+            &state.db,
+            &s.actor,
+            "session.logout",
+            s.root_folder.as_deref(),
+            Some(serde_json::json!({ "role": s.role })),
+        )
+        .await?;
+        jar = jar.remove(removal_cookie(s));
+    }
+    Ok((
+        jar,
+        Json(LogoutResponse {
+            ended: targets.len(),
+        }),
+    ))
 }

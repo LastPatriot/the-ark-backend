@@ -42,6 +42,16 @@ impl Resp {
     }
 }
 
+/// A session id goes in as a bearer token; a `name=value` cookie pair (from a join
+/// link's Set-Cookie) goes in as a cookie.
+fn auth_header(sid: &str) -> (header::HeaderName, String) {
+    if sid.contains('=') {
+        (header::COOKIE, sid.to_string())
+    } else {
+        (header::AUTHORIZATION, format!("Bearer {sid}"))
+    }
+}
+
 impl Drop for TestApp {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.dir);
@@ -86,7 +96,8 @@ impl TestApp {
     ) -> Resp {
         let mut req = Request::builder().method(method).uri(uri);
         if let Some(sid) = sid {
-            req = req.header(header::AUTHORIZATION, format!("Bearer {sid}"));
+            let (name, value) = auth_header(sid);
+            req = req.header(name, value);
         }
         let req = match body {
             Some(b) => req
@@ -164,6 +175,30 @@ impl TestApp {
         r.json()["session_id"].as_str().unwrap().to_string()
     }
 
+    /// Unlocks as a browser holding `cookies` would, and returns its cookie pair.
+    async fn unlock_cookie(
+        &self,
+        cookies: Option<&str>,
+        slug: &str,
+        path: &str,
+        pin: &str,
+    ) -> String {
+        let r = self
+            .post(
+                &format!("/api/v1/folders/{slug}/unlock"),
+                cookies,
+                json!({"pin": pin, "path": path}),
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+        r.header("set-cookie")
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string()
+    }
+
     /// Single-request tus upload. Returns the final PATCH response.
     async fn upload(&self, sid: &str, slug: &str, path: &str, filename: &str, data: &[u8]) -> Resp {
         let meta = format!(
@@ -173,7 +208,7 @@ impl TestApp {
             STANDARD.encode(path)
         );
         let create = Request::post("/api/v1/uploads")
-            .header(header::AUTHORIZATION, format!("Bearer {sid}"))
+            .header(auth_header(sid).0, auth_header(sid).1)
             .header("tus-resumable", "1.0.0")
             .header("upload-length", data.len())
             .header("upload-metadata", meta)
@@ -185,7 +220,7 @@ impl TestApp {
         }
         let location = r.header("location").unwrap();
         let patch = Request::patch(location)
-            .header(header::AUTHORIZATION, format!("Bearer {sid}"))
+            .header(auth_header(sid).0, auth_header(sid).1)
             .header("tus-resumable", "1.0.0")
             .header("upload-offset", 0)
             .header(header::CONTENT_TYPE, "application/offset+octet-stream")
@@ -525,6 +560,356 @@ async fn join_token_respects_max_uses() {
             .await
             .status,
         StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn contributor_join_link_views_downloads_and_uploads_in_the_subtree() {
+    let (t, admin) = fixture().await;
+    let editor = t.unlock("sunday-service", "", "1111").await;
+    let theirs = t
+        .upload(
+            &editor,
+            "sunday-service",
+            "day-1/photos",
+            "a.jpg",
+            b"theirs",
+        )
+        .await
+        .header("ark-file-id")
+        .unwrap();
+    let folders = t.get("/api/v1/admin/folders", &admin).await.json();
+    let sunday = folders
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["slug"] == "sunday-service")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let r = t
+        .post(
+            "/api/v1/admin/tokens",
+            Some(&admin),
+            json!({"folder_id": sunday, "role": "contributor", "label": "guests"}),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let secret = r.json()["secret"].as_str().unwrap().to_string();
+    let joined = t
+        .call(Method::GET, &format!("/j/{secret}"), None, None)
+        .await;
+    assert_eq!(joined.status, StatusCode::FOUND);
+    let set_cookie = joined.header("set-cookie").unwrap();
+    let cookie = set_cookie.split(';').next().unwrap();
+
+    // Everything below the link's folder: list and download others' files, upload.
+    let items = t.items(cookie, "sunday-service", "day-1/photos").await;
+    assert_eq!(items.status, StatusCode::OK);
+    assert_eq!(items.json()["files"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        t.get(&format!("/dl/{theirs}"), cookie).await.text(),
+        "theirs"
+    );
+    let up = t
+        .upload(cookie, "sunday-service", "day-2", "mine.jpg", b"mine")
+        .await;
+    assert_eq!(up.status, StatusCode::NO_CONTENT, "{}", up.text());
+    // But nothing outside it.
+    assert_eq!(
+        t.items(cookie, "youth-camp", "").await.status,
+        StatusCode::FORBIDDEN
+    );
+
+    let r = t
+        .post(
+            "/api/v1/admin/tokens",
+            Some(&admin),
+            json!({"folder_id": sunday, "role": "editor", "label": "nope"}),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn guest_views_downloads_and_uploads_but_changes_nothing() {
+    let (t, admin) = fixture().await;
+    let editor = t.unlock("sunday-service", "", "1111").await;
+    let theirs = t
+        .upload(
+            &editor,
+            "sunday-service",
+            "day-1/photos",
+            "a.jpg",
+            b"theirs",
+        )
+        .await
+        .header("ark-file-id")
+        .unwrap();
+    let folders = t.get("/api/v1/admin/folders", &admin).await.json();
+    let youth = folders
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["slug"] == "youth-camp")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    t.pin(&admin, Some(&youth), "5555", "guest").await;
+    let sunday = t.items(&admin, "sunday-service", "").await.json()["folder"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let r = t
+        .post(
+            "/api/v1/admin/tokens",
+            Some(&admin),
+            json!({"folder_id": sunday, "role": "guest", "label": "guests"}),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let secret = r.json()["secret"].as_str().unwrap().to_string();
+    let joined = t
+        .call(Method::GET, &format!("/j/{secret}"), None, None)
+        .await;
+    let guest = joined
+        .header("set-cookie")
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+
+    // Sees and downloads everyone's files, in subfolders too, and uploads.
+    let items = t.items(&guest, "sunday-service", "day-1/photos").await;
+    assert_eq!(items.json()["files"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        t.get(&format!("/dl/{theirs}"), &guest).await.text(),
+        "theirs"
+    );
+    let up = t
+        .upload(&guest, "sunday-service", "day-1/photos", "b.jpg", b"mine")
+        .await;
+    assert_eq!(up.status, StatusCode::NO_CONTENT);
+    let mine = up.header("ark-file-id").unwrap();
+
+    // No subfolders, no rename, no delete, not even of its own upload.
+    let r = t
+        .post(
+            "/api/v1/folders/sunday-service/subfolders",
+            Some(&guest),
+            json!({"name": "by guest"}),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+    for id in [&theirs, &mine] {
+        let item = format!("/api/v1/items/{id}");
+        let rename = json!({"name": "renamed.jpg"});
+        assert_eq!(
+            t.call(Method::PATCH, &item, Some(&guest), Some(rename))
+                .await
+                .status,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            t.call(Method::DELETE, &item, Some(&guest), None)
+                .await
+                .status,
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    // A guest PIN works the same way.
+    let pin_guest = t.unlock("youth-camp", "", "5555").await;
+    let up = t.upload(&pin_guest, "youth-camp", "", "c.jpg", b"c").await;
+    assert_eq!(up.status, StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn admin_can_look_up_pins_and_links_again() {
+    let (t, admin) = fixture().await;
+    let pins = t.get("/api/v1/admin/pins", &admin).await.json();
+    let mut digits: Vec<&str> = pins
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["pin"].as_str().unwrap())
+        .collect();
+    digits.sort();
+    assert_eq!(digits, ["1111", "2222", "3333"]);
+    assert!(
+        !t.get("/api/v1/admin/pins", &admin)
+            .await
+            .text()
+            .contains("sealed")
+    );
+
+    let sunday = t.items(&admin, "sunday-service", "").await.json()["folder"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let created = t
+        .post(
+            "/api/v1/admin/tokens",
+            Some(&admin),
+            json!({"folder_id": sunday, "role": "viewer", "label": "poster"}),
+        )
+        .await
+        .json();
+    let listed = t.get("/api/v1/admin/tokens", &admin).await.json();
+    let url = listed[0]["url"].as_str().unwrap();
+    assert_eq!(url, created["url"].as_str().unwrap());
+    assert!(url.ends_with(created["secret"].as_str().unwrap()));
+    let path = &url[url.find("/j/").unwrap()..];
+    assert_eq!(
+        t.call(Method::GET, path, None, None).await.status,
+        StatusCode::FOUND
+    );
+
+    // Revoked ones are no longer shown, even with include_revoked.
+    let id = created["id"].as_str().unwrap();
+    t.call(
+        Method::DELETE,
+        &format!("/api/v1/admin/tokens/{id}"),
+        Some(&admin),
+        None,
+    )
+    .await;
+    let listed = t
+        .get("/api/v1/admin/tokens?include_revoked=true", &admin)
+        .await
+        .json();
+    assert!(listed[0]["url"].is_null());
+    let pin_id = pins[0]["id"].as_str().unwrap();
+    t.call(
+        Method::DELETE,
+        &format!("/api/v1/admin/pins/{pin_id}"),
+        Some(&admin),
+        None,
+    )
+    .await;
+    let pins = t
+        .get("/api/v1/admin/pins?include_revoked=true", &admin)
+        .await
+        .json();
+    let revoked = pins
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["id"] == pin_id)
+        .unwrap();
+    assert!(revoked["pin"].is_null());
+}
+
+#[tokio::test]
+async fn sessions_do_not_combine() {
+    let (t, _) = fixture().await;
+    let editor = t.unlock_cookie(None, "sunday-service", "", "1111").await;
+    let viewer = t
+        .unlock_cookie(None, "sunday-service", "day-1", "2222")
+        .await;
+    let both = format!("{editor}; {viewer}");
+
+    // In day-1 only the viewer session (rooted closer) counts: no editor upload there.
+    let up = t
+        .upload(&both, "sunday-service", "day-1", "a.txt", b"a")
+        .await;
+    assert_eq!(up.status, StatusCode::FORBIDDEN);
+    // Elsewhere in sunday-service the editor session still applies.
+    let up = t
+        .upload(&both, "sunday-service", "day-2", "b.txt", b"b")
+        .await;
+    assert_eq!(up.status, StatusCode::NO_CONTENT);
+
+    // Ending day-1's session hands day-1 back to the editor session.
+    let day1 = t.items(&both, "sunday-service", "day-1").await.json()["folder"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let r = t
+        .post("/api/v1/logout", Some(&both), json!({"folder_id": day1}))
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["ended"], 1);
+    let cleared = r.header("set-cookie").unwrap();
+    assert!(
+        cleared.starts_with(viewer.split('=').next().unwrap()) && cleared.contains("Max-Age=0"),
+        "{cleared}"
+    );
+    assert_eq!(
+        t.items(&viewer, "sunday-service", "day-1").await.status,
+        StatusCode::UNAUTHORIZED
+    );
+    let up = t
+        .upload(&both, "sunday-service", "day-1", "a.txt", b"a")
+        .await;
+    assert_eq!(up.status, StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn unlocking_again_replaces_the_folder_session() {
+    let (t, admin) = fixture().await;
+    let day1 = t.items(&admin, "sunday-service", "day-1").await.json()["folder"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    t.pin(&admin, Some(&day1), "4444", "contributor").await;
+
+    let viewer = t
+        .unlock_cookie(None, "sunday-service", "day-1", "2222")
+        .await;
+    let contributor = t
+        .unlock_cookie(Some(&viewer), "sunday-service", "day-1", "4444")
+        .await;
+    assert_eq!(viewer.split('=').next(), contributor.split('=').next());
+    assert_eq!(
+        t.items(&viewer, "sunday-service", "day-1").await.status,
+        StatusCode::UNAUTHORIZED
+    );
+    let up = t
+        .upload(&contributor, "sunday-service", "day-1", "c.txt", b"c")
+        .await;
+    assert_eq!(up.status, StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn logout_targets() {
+    let (t, admin) = fixture().await;
+    let viewer = t
+        .unlock_cookie(None, "sunday-service", "day-1", "2222")
+        .await;
+    for body in [
+        json!({}),
+        json!({"all": true, "role": "admin"}),
+        json!({"role": "viewer"}),
+    ] {
+        let r = t.post("/api/v1/logout", Some(&viewer), body.clone()).await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{body}");
+    }
+    // Nothing to end is not an error.
+    let r = t.post("/api/v1/logout", None, json!({"all": true})).await;
+    assert_eq!(
+        (r.status, r.json()["ended"].clone()),
+        (StatusCode::OK, json!(0))
+    );
+
+    let r = t
+        .post("/api/v1/logout", Some(&admin), json!({"role": "admin"}))
+        .await;
+    assert_eq!(r.json()["ended"], 1);
+    assert_eq!(
+        t.get("/api/v1/admin/folders", &admin).await.status,
+        StatusCode::UNAUTHORIZED
+    );
+    let r = t
+        .post("/api/v1/logout", Some(&viewer), json!({"all": true}))
+        .await;
+    assert_eq!(r.json()["ended"], 1);
+    assert_eq!(
+        t.items(&viewer, "sunday-service", "day-1").await.status,
+        StatusCode::UNAUTHORIZED
     );
 }
 

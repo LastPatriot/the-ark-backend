@@ -99,6 +99,14 @@ Full list of codes in §12.
   `{ sessions: [{folder_id, folder_slug, path, role}], hub, admin }`. Use it to pick
   the role for the folder on screen, and to show "unlocked" state on the home page.
 - A session covers its folder **and everything below it**, never parents or siblings.
+- **Sessions never combine.** In any folder, exactly one session decides what the user
+  can do: the one unlocked closest to that folder (hub/admin only where no folder
+  session covers it). Example: viewer PIN on `sunday-service`, then uploader QR on
+  `day-1` -> `day-1` is upload-only, the rest of `sunday-service` is still view-only.
+  Show the role of the session that applies (the `/me` entry whose folder is the
+  current folder or its nearest ancestor).
+- **Unlocking a folder again replaces its session.** Entering a contributor PIN where
+  the browser has a viewer session for that same folder ends the viewer one.
 
 **Folder page flow** (`/f/{slug}/{path...}`):
 
@@ -120,23 +128,39 @@ GET /api/v1/folders/{slug}/items?path={path}
 - **Join links / QR codes** (`/j/{token}`) are handled entirely by the backend: it sets
   the cookie and redirects (302) to `/f/{slug}/{path}`. The app just loads that route as
   usual. An expired or used-up link returns a JSON 404; we can make that a nicer page later.
-- There is **no logout endpoint yet**. Sessions expire on their own. Ask Opeyemi if
-  you need a "lock this folder" button.
+- **Lock / switch role:** `POST /api/v1/logout` ends sessions and clears their cookies.
+  Send exactly one of:
+  - `{"folder_id": "..."}`: ends the session that applies in that folder (pass the
+    current folder's `id` from the items response). The next items call returns 401
+    (PIN pad) or falls back to a session on a parent folder.
+  - `{"role": "hub"}` / `{"role": "admin"}`: ends that session.
+  - `{"all": true}`: ends everything on this browser.
+
+  Returns `{ended: n}` (`0` is fine). Afterwards refetch `/me` and the current folder,
+  and close and reopen the `EventSource`: the server closes streams of ended sessions
+  within a few seconds. Resumable uploads belong to the session that started them, so
+  warn before locking while uploads are in progress.
 
 ## 5. Roles: what to show
 
-| UI | viewer | uploader | contributor | editor | hub | admin |
-| --- | --- | --- | --- | --- | --- | --- |
-| Browse folder, see previews | yes | **own uploads only** | yes | yes | yes | yes |
-| Download / play / ZIP | yes | **no** | yes | yes | yes | yes |
-| Upload button | no | yes | yes | yes | yes | yes |
-| New subfolder | no | no | yes | yes | yes | yes |
-| Rename, move, tag, delete, restore, versions | no | no | no | yes | yes | yes |
-| Home page folder list | no | no | no | no | yes | yes |
-| Admin screens | no | no | no | no | no | yes |
+| UI | viewer | uploader | guest | contributor | editor | hub | admin |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Browse folder, see previews | yes | **own uploads only** | yes | yes | yes | yes | yes |
+| Download / play / ZIP | yes | **no** | yes | yes | yes | yes | yes |
+| Upload button | no | yes | yes | yes | yes | yes | yes |
+| New subfolder | no | no | **no** | yes | yes | yes | yes |
+| Rename, move, tag, delete, restore, versions | no | no | no | no | yes | yes | yes |
+| Home page folder list | no | no | no | no | no | yes | yes |
+| Admin screens | no | no | no | no | no | no | yes |
 
 Uploader is the "upload-only QR" role (e.g. a poster at the entrance): an upload page
 that shows what *this phone* sent, nothing else.
+
+Guest is the "see everything, download, add yours" role: nothing can be renamed,
+deleted or created, not even the guest's own uploads. It is the usual event QR.
+
+Join links can be `viewer`, `uploader`, `guest` or `contributor`. Like PINs, a link
+covers its folder and every subfolder below it.
 
 ## 6. Browsing
 
@@ -270,8 +294,8 @@ the original name.
 | Screen | Endpoints |
 | --- | --- |
 | Folders | `GET/POST /admin/folders`, `PATCH/DELETE /admin/folders/{id}` (delete = archive) |
-| PINs | `GET/POST /admin/pins`, `PATCH/DELETE /admin/pins/{id}`; omit `folder_id` + role `hub` for the hub PIN. Revoking signs out its sessions |
-| QR / join links | `POST /admin/tokens` -> `{url, secret}` **shown once**; `DELETE /admin/tokens/{id}` |
+| PINs | `GET/POST /admin/pins`, `PATCH/DELETE /admin/pins/{id}`; omit `folder_id` + role `hub` for the hub PIN. Revoking signs out its sessions. Each PIN in the list has its digits in `pin`, so the admin can look them up any time (`null` for revoked PINs and ones made before this existed: show "revoke and recreate to see it") |
+| QR / join links | `POST /admin/tokens` `{folder_id, role: viewer\|uploader\|guest\|contributor, label, expires_at?, max_uses?}`; `GET /admin/tokens` lists them with their `url` (same `null` rule), so the QR can be shown or reprinted any time; `DELETE /admin/tokens/{id}` |
 | QR image | `<img src="/api/v1/admin/qr?url={encoded url}&format=svg">` (or `png` for printing) |
 | Sessions | `GET /admin/sessions`, `DELETE /admin/sessions/{handle}` |
 | Activity | `GET /admin/activity?limit=50&before={next_before}` |
@@ -304,7 +328,7 @@ have a first build.
 
 | Status | Codes |
 | --- | --- |
-| 400 | `invalid_pin_format`, `pin_required`, `invalid_name`, `invalid_slug`, `invalid_role`, `invalid_label`, `invalid_time`, `invalid_move`, `not_a_file`, `password_too_short`, `default_role_required`, `empty_selection`, `too_many_files`, `invalid_url`, `invalid_hostname`; uploads: `missing_upload_length`, `missing_upload_offset`, `missing_filename`, `missing_folder`, `invalid_metadata`, `invalid_header` |
+| 400 | `invalid_logout`, `invalid_pin_format`, `pin_required`, `invalid_name`, `invalid_slug`, `invalid_role`, `invalid_label`, `invalid_time`, `invalid_move`, `not_a_file`, `password_too_short`, `default_role_required`, `empty_selection`, `too_many_files`, `invalid_url`, `invalid_hostname`; uploads: `missing_upload_length`, `missing_upload_offset`, `missing_filename`, `missing_folder`, `invalid_metadata`, `invalid_header` |
 | 401 | `unauthorized`, `invalid_pin`, `invalid_password`, `invalid_setup_code` |
 | 403 | `forbidden` |
 | 404 | `not_found` |
@@ -316,7 +340,6 @@ have a first build.
 
 ## 13. Known gaps (ask Opeyemi)
 
-- No logout / "lock folder" endpoint.
 - Editors can't list the trash (only admins can); restore needs the file id.
 - No HEIC thumbnails.
 - Accented letters are dropped from slugs (`Ọdún` -> `d-n`).
