@@ -356,6 +356,155 @@ pub async fn hub_unlock(
     ))
 }
 
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct PinUnlockRequest {
+    #[schema(example = "482193")]
+    pub pin: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct PinUnlockResponse {
+    #[serde(flatten)]
+    pub session: SessionResponse,
+    /// Where to go: `/f/{folder_slug}/{path}`. Null for the hub PIN (go to the home page).
+    pub folder_slug: Option<String>,
+    /// Subfolder path below `folder_slug`; empty for the top level.
+    pub path: Option<String>,
+}
+
+#[derive(sqlx::FromRow)]
+struct AnyPin {
+    #[sqlx(flatten)]
+    stored: pin::StoredPin,
+    folder_id: Option<String>,
+    label: String,
+    role: Role,
+}
+
+/// Unlock from the home page with a PIN alone: the PIN decides the folder (and role).
+/// Works for every folder PIN and for the hub PIN. Has its own lockout, separate from
+/// the folder pages'.
+#[utoipa::path(
+    post,
+    path = "/api/v1/unlock",
+    tag = "auth",
+    request_body = PinUnlockRequest,
+    responses(
+        (status = 200, description = "Session created; cookie set. Go to the folder in the response", body = PinUnlockResponse),
+        (status = 400, description = "Malformed PIN", body = ErrorBody),
+        (status = 401, description = "Wrong PIN", body = ErrorBody),
+        (status = 409, description = "`ambiguous_pin`: the PIN works on several folders; enter it on the folder's own page", body = ErrorBody),
+        (status = 429, description = "Locked out after repeated failures", body = ErrorBody),
+    )
+)]
+pub async fn pin_unlock(
+    State(state): State<AppState>,
+    auth: Auth,
+    jar: SignedCookieJar,
+    Json(req): Json<PinUnlockRequest>,
+) -> AppResult<(SignedCookieJar, Json<PinUnlockResponse>)> {
+    pin::validate_pin(&req.pin)?;
+    let lock_key = format!("pin:any:{}", auth.ip);
+    pin::check_lock(&state.db, &lock_key).await?;
+
+    let pins: Vec<AnyPin> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT {}, folder_id, label, role FROM pins WHERE {}",
+        pin::STORED_PIN_COLUMNS,
+        pin::ACTIVE_PIN
+    )))
+    .bind(util::now())
+    .fetch_all(&state.db)
+    .await?;
+    let mut matches = Vec::new();
+    for i in pin::matching(&state.vault, &req.pin, pins.iter().map(|p| &p.stored)).await? {
+        // PINs of archived folders (or of folders inside one) unlock nothing.
+        let live = match &pins[i].folder_id {
+            None => true,
+            Some(id) => {
+                let archived: i64 = sqlx::query_scalar(
+                    "WITH RECURSIVE chain(id, parent_id, archived_at) AS (
+                         SELECT id, parent_id, archived_at FROM folders WHERE id = ?
+                         UNION ALL
+                         SELECT f.id, f.parent_id, f.archived_at
+                         FROM folders f JOIN chain c ON f.id = c.parent_id
+                     )
+                     SELECT COUNT(*) FROM chain WHERE archived_at IS NOT NULL",
+                )
+                .bind(id)
+                .fetch_one(&state.db)
+                .await?;
+                archived == 0
+            }
+        };
+        if live {
+            matches.push(i);
+        }
+    }
+
+    let matched = match matches.as_slice() {
+        [] => {
+            pin::record_failure(&state.db, &lock_key).await?;
+            return Err(AppError::Unauthorized(
+                "invalid_pin",
+                "PIN is incorrect".into(),
+            ));
+        }
+        [i] => &pins[*i],
+        // Only possible with PINs from before digits had to be unique.
+        _ => {
+            pin::record_success(&state.db, &lock_key).await?;
+            return Err(AppError::conflict(
+                "ambiguous_pin",
+                "This PIN works on more than one folder. Open the folder's link and enter it there",
+            ));
+        }
+    };
+    pin::record_success(&state.db, &lock_key).await?;
+    sqlx::query("UPDATE pins SET uses = uses + 1 WHERE id = ?")
+        .bind(&matched.stored.id)
+        .execute(&state.db)
+        .await?;
+
+    let (folder_slug, path) = match &matched.folder_id {
+        Some(id) => {
+            let (slug, path) = folder_path(&state.db, id).await?;
+            (Some(slug), Some(path))
+        }
+        None => (None, None),
+    };
+    db::audit(
+        &state.db,
+        &matched.label,
+        "pin.unlock",
+        matched.folder_id.as_deref(),
+        Some(serde_json::json!({ "role": matched.role })),
+    )
+    .await?;
+    let (session_id, cookie) = create_session(
+        &state,
+        &auth,
+        NewSession {
+            root_folder: matched.folder_id.as_deref(),
+            role: matched.role,
+            pin_id: Some(&matched.stored.id),
+            token_id: None,
+        },
+    )
+    .await?;
+    Ok((
+        jar.add(cookie),
+        Json(PinUnlockResponse {
+            session: SessionResponse {
+                session_id,
+                role: matched.role,
+                root_folder: matched.folder_id.clone(),
+            },
+            folder_slug,
+            path,
+        }),
+    ))
+}
+
 #[derive(Debug, Serialize, ToSchema, sqlx::FromRow)]
 pub struct HubFolder {
     pub id: String,

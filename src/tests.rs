@@ -804,6 +804,133 @@ async fn admin_can_look_up_pins_and_links_again() {
 }
 
 #[tokio::test]
+async fn pin_alone_opens_its_folder_from_the_home_page() {
+    let (t, admin) = fixture().await;
+    let r = t.post("/api/v1/unlock", None, json!({"pin": "2222"})).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let body = r.json();
+    assert_eq!(
+        (&body["role"], &body["folder_slug"], &body["path"]),
+        (&json!("viewer"), &json!("sunday-service"), &json!("day-1"))
+    );
+    let sid = body["session_id"].as_str().unwrap();
+    assert!(r.header("set-cookie").is_some());
+    // Scoped to the PIN's own folder, exactly like unlocking it on its page.
+    assert_eq!(
+        t.items(sid, "sunday-service", "day-1/photos").await.status,
+        StatusCode::OK
+    );
+    assert_eq!(
+        t.items(sid, "sunday-service", "").await.status,
+        StatusCode::FORBIDDEN
+    );
+
+    // The hub PIN works here too.
+    t.pin(&admin, None, "9090", "hub").await;
+    let r = t.post("/api/v1/unlock", None, json!({"pin": "9090"})).await;
+    assert_eq!(r.json()["role"], "hub");
+    assert!(r.json()["folder_slug"].is_null());
+
+    // PINs of archived folders open nothing.
+    let folders = t.get("/api/v1/admin/folders", &admin).await.json();
+    let youth = folders
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["slug"] == "youth-camp")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    t.pin(&admin, Some(&youth), "5555", "guest").await;
+    assert_eq!(
+        t.post("/api/v1/unlock", None, json!({"pin": "5555"}))
+            .await
+            .status,
+        StatusCode::OK
+    );
+    t.call(
+        Method::DELETE,
+        &format!("/api/v1/admin/folders/{youth}"),
+        Some(&admin),
+        None,
+    )
+    .await;
+    assert_eq!(
+        t.post("/api/v1/unlock", None, json!({"pin": "5555"}))
+            .await
+            .status,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
+async fn pin_digits_are_unique_across_ark() {
+    let (t, admin) = fixture().await;
+    let folders = t.get("/api/v1/admin/folders", &admin).await.json();
+    let youth = folders
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["slug"] == "youth-camp")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    for (folder, role) in [(Some(youth.as_str()), "guest"), (None, "hub")] {
+        let r = t
+            .post(
+                "/api/v1/admin/pins",
+                Some(&admin),
+                json!({"folder_id": folder, "label": "dup", "pin": "2222", "role": role}),
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::CONFLICT, "{role}");
+        assert_eq!(r.json()["error"], "pin_in_use");
+    }
+
+    // Duplicates from before the rule (no encrypted copy, so argon2 is checked) make
+    // the home-page unlock ambiguous; the folder page still works.
+    t.pin(&admin, Some(&youth), "7777", "guest").await;
+    sqlx::query(
+        "UPDATE pins SET pin_hash = (SELECT pin_hash FROM pins WHERE label = 'viewer 2222'),
+                         pin_sealed = NULL
+         WHERE label = 'guest 7777'",
+    )
+    .execute(&t.state.db)
+    .await
+    .unwrap();
+    let r = t.post("/api/v1/unlock", None, json!({"pin": "2222"})).await;
+    assert_eq!(
+        (r.status, r.json()["error"].clone()),
+        (StatusCode::CONFLICT, json!("ambiguous_pin"))
+    );
+    assert_eq!(
+        t.unlock_resp("youth-camp", "", "2222").await.status,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn home_page_unlock_has_its_own_lockout() {
+    let (t, _) = fixture().await;
+    for _ in 0..5 {
+        let r = t.post("/api/v1/unlock", None, json!({"pin": "0000"})).await;
+        assert_eq!(r.status, StatusCode::UNAUTHORIZED);
+    }
+    let r = t.post("/api/v1/unlock", None, json!({"pin": "2222"})).await;
+    assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS);
+    assert!(r.header("retry-after").is_some());
+    // Folder pages are not locked by it.
+    assert_eq!(
+        t.unlock_resp("sunday-service", "day-1", "2222")
+            .await
+            .status,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
 async fn sessions_do_not_combine() {
     let (t, _) = fixture().await;
     let editor = t.unlock_cookie(None, "sunday-service", "", "1111").await;

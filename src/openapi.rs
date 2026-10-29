@@ -21,6 +21,7 @@ use crate::{auth, error, routes};
         routes::folders::me,
         routes::folders::logout,
         routes::folders::hub_unlock,
+        routes::folders::pin_unlock,
         routes::folders::unlock,
         routes::join::join,
         routes::folders::list_folders,

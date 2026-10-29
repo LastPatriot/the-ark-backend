@@ -183,6 +183,7 @@ pub fn app(state: AppState) -> Router {
         .route("/me", get(routes::folders::me))
         .route("/logout", post(routes::folders::logout))
         .route("/hub/unlock", post(routes::folders::hub_unlock))
+        .route("/unlock", post(routes::folders::pin_unlock))
         .route("/folders", get(routes::folders::list_folders))
         .route("/folders/{slug}/unlock", post(routes::folders::unlock))
         .route("/folders/{slug}/items", get(routes::folders::list_items))

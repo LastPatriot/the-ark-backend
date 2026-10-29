@@ -25,6 +25,10 @@ Regenerate the typed client (§2) first: request and response shapes changed.
 - `POST /admin/tokens` responses: `url` is now part of the token object (still at the
   top level of the JSON, so `r.url` still works), and `secret` is unchanged.
 - New error code `invalid_logout` (§12).
+- **PIN on the home page:** new `POST /api/v1/unlock` `{pin}`. The PIN alone decides
+  the folder and role, so `http://ark.local` can be a single PIN pad (§4). PIN digits
+  are now unique across all of Ark (`409 pin_in_use` when the admin reuses them), and
+  there's a new `409 ambiguous_pin` for old duplicates.
 
 ---
 
@@ -142,6 +146,25 @@ Full list of codes in §12.
   QR) and call unlock for the current folder. The new session is either the same
   folder's (it replaces the old one) or rooted closer, so it applies. Use logout (below)
   when they want to *drop* access, e.g. "Lock" on a shared phone.
+
+**Home page flow** (`/`): one PIN pad, no folder picker needed.
+
+```
+POST /api/v1/unlock {"pin": "482193"}
+  200 {session_id, role, root_folder, folder_slug, path}
+        folder_slug set -> go to /f/{folder_slug}/{path}   (path "" -> /f/{folder_slug})
+        folder_slug null -> hub PIN: show the folder list (GET /api/v1/folders)
+  401 invalid_pin -> "Wrong PIN"        429 -> countdown from Retry-After
+  409 ambiguous_pin -> "This PIN is used by more than one folder. Open the folder's
+                        link or QR and enter it there."
+```
+
+- It accepts every folder PIN and the hub PIN. A PIN opens its own folder and everything
+  below it, the same as entering it on that folder's page.
+- Its lockout is separate from the folder pages' (5 wrong tries, then 5 minutes,
+  doubling). A device locked out here can still unlock a folder on its own page.
+- If the browser already has a hub or admin session, still show the PIN pad (e.g. "Have
+  a folder PIN?") next to the folder list.
 
 **Folder page flow** (`/f/{slug}/{path...}`):
 
@@ -343,6 +366,10 @@ the original name.
 the QR from it, or from a join token's `url`.
 
 **PIN and QR screens:**
+- PIN digits are **unique across Ark** (folder PINs and the hub PIN), because the home
+  page finds the folder from the PIN. `409 pin_in_use` means those digits are taken
+  somewhere: ask for others, or offer "Generate" (random 6 digits). Suggest 6+ digits;
+  a 4-digit PIN is easy to guess when every folder shares one PIN pad.
 - Default the role picker to **guest** for event-wide PINs and QRs. Explain each choice in
   one line using §5 (e.g. "Guest: can see, download and add photos; can't delete").
 - List PINs and links per folder with their label, role, uses and expiry, plus the PIN
@@ -359,7 +386,7 @@ The app owns these routes (history API, no hash routing):
 
 | Route | Page |
 | --- | --- |
-| `/` | Home: hub folder list, or a "scan a QR / enter a folder" landing |
+| `/` | Home: PIN pad (`POST /api/v1/unlock`); plus the folder list for hub/admin sessions |
 | `/f/{slug}` and `/f/{slug}/{sub/path}` | Folder page |
 | `/admin/...` | Admin screens (your choice of sub-routes) |
 
@@ -378,7 +405,7 @@ have a first build.
 | 401 | `unauthorized`, `invalid_pin`, `invalid_password`, `invalid_setup_code` |
 | 403 | `forbidden` |
 | 404 | `not_found` |
-| 409 | `slug_taken`, `name_taken`, `in_trash`, `not_empty`, `pin_in_use`, `already_set_up`, `offset_mismatch` |
+| 409 | `slug_taken`, `name_taken`, `in_trash`, `not_empty`, `pin_in_use`, `ambiguous_pin`, `already_set_up`, `offset_mismatch` |
 | 412 / 413 / 415 | `tus_version` / `quota_exceeded`, `too_large`, `chunk_too_large` / `content_type` |
 | 429 | `too_many_attempts` (+ `Retry-After`) |
 | 503 | `setup_required` |

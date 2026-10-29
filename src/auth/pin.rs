@@ -8,6 +8,7 @@ use sqlx::SqlitePool;
 use crate::{
     error::{AppError, AppResult},
     util,
+    vault::Vault,
 };
 
 const LOCK_AFTER: i64 = 5;
@@ -51,6 +52,68 @@ pub async fn find_match(secret: String, hashes: Vec<String>) -> AppResult<Option
     })
     .await
     .map_err(|e| AppError::Internal(e.into()))
+}
+
+/// A stored PIN as needed to check one. Select it with [`STORED_PIN_COLUMNS`].
+#[derive(sqlx::FromRow)]
+pub struct StoredPin {
+    pub id: String,
+    pub hash: String,
+    /// Encrypted copy (src/vault.rs); None for PINs from before Ark kept them.
+    pub sealed: Option<String>,
+}
+
+pub const STORED_PIN_COLUMNS: &str = "id, pin_hash AS hash, pin_sealed AS sealed";
+
+/// Active (not revoked, expired or used up) PINs: the ones that can unlock.
+pub const ACTIVE_PIN: &str = "revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?1)
+     AND (max_uses IS NULL OR uses < max_uses)";
+
+/// Indexes of every PIN in `pins` that `entered` matches. Compares against the
+/// decrypted copy where there is one, so checking every PIN in Ark stays fast; argon2
+/// only runs for PINs without a copy.
+pub async fn matching<'a>(
+    vault: &Vault,
+    entered: &str,
+    pins: impl IntoIterator<Item = &'a StoredPin>,
+) -> AppResult<Vec<usize>> {
+    let mut found = Vec::new();
+    let mut legacy = Vec::new();
+    for (i, p) in pins.into_iter().enumerate() {
+        match p.sealed.as_deref().and_then(|s| vault.open(&p.id, s)) {
+            Some(plain) => {
+                if constant_time_eq(plain.as_bytes(), entered.as_bytes()) {
+                    found.push(i);
+                }
+            }
+            None => legacy.push((i, p.hash.clone())),
+        }
+    }
+    if !legacy.is_empty() {
+        let secret = entered.to_string();
+        let hits = tokio::task::spawn_blocking(move || {
+            legacy
+                .into_iter()
+                .filter(|(_, h)| {
+                    PasswordHash::new(h).is_ok_and(|parsed| {
+                        Argon2::default()
+                            .verify_password(secret.as_bytes(), &parsed)
+                            .is_ok()
+                    })
+                })
+                .map(|(i, _)| i)
+                .collect::<Vec<_>>()
+        })
+        .await
+        .map_err(|e| AppError::Internal(e.into()))?;
+        found.extend(hits);
+        found.sort_unstable();
+    }
+    Ok(found)
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 /// Fails with 429 while `key` is locked out.

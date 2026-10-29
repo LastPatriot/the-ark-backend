@@ -449,7 +449,7 @@ pub async fn list_pins(
         (status = 401, body = ErrorBody),
         (status = 403, body = ErrorBody),
         (status = 404, description = "No such folder", body = ErrorBody),
-        (status = 409, description = "Same PIN already active on this folder", body = ErrorBody),
+        (status = 409, description = "Those digits are already an active PIN somewhere in Ark", body = ErrorBody),
     )
 )]
 pub async fn create_pin(
@@ -487,20 +487,24 @@ pub async fn create_pin(
     }
     let expires_at = parse_expiry(req.expires_at)?;
 
-    // Two active PINs with the same digits on one folder would make the role ambiguous.
+    // PIN digits are unique across Ark: `POST /api/v1/unlock` finds the folder from the
+    // PIN alone, and two folders sharing digits would make that ambiguous.
     let now = util::now();
-    let existing: Vec<String> = sqlx::query_scalar(
-        "SELECT pin_hash FROM pins WHERE folder_id IS ? AND revoked_at IS NULL
-           AND (expires_at IS NULL OR expires_at > ?)",
-    )
-    .bind(&req.folder_id)
+    let existing: Vec<pin::StoredPin> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT {} FROM pins WHERE {}",
+        pin::STORED_PIN_COLUMNS,
+        pin::ACTIVE_PIN
+    )))
     .bind(&now)
     .fetch_all(&state.db)
     .await?;
-    if pin::find_match(req.pin.clone(), existing).await?.is_some() {
+    if !pin::matching(&state.vault, &req.pin, &existing)
+        .await?
+        .is_empty()
+    {
         return Err(AppError::conflict(
             "pin_in_use",
-            "That PIN is already active on this folder",
+            "That PIN is already in use in Ark; choose another",
         ));
     }
 

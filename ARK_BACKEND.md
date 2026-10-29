@@ -271,6 +271,9 @@ Every session has a `root_folder`. A request on folder `F` is allowed only if `F
   They never combine: in folder `F` only the session rooted closest to `F` counts (hub
   and admin only where no folder session covers `F`). Unlocking a folder again ends the
   session it replaces; `POST /api/v1/logout` ends one or all.
+- `POST /api/v1/unlock` `{pin}` unlocks from the home page: the PIN alone picks the
+  folder (or the hub). PIN digits are therefore unique across all active PINs; its
+  lockout key is separate from the per-folder ones.
 - PINs and join-token secrets are also stored encrypted (key in `<data_dir>/secret.key`)
   so the admin can look them up; the hashes still do the checking.
 
