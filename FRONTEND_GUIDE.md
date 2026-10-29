@@ -7,6 +7,25 @@ can't say: flows, constraints of the venue network, and gotchas.
 Backend owner: Opeyemi. If something here disagrees with `/docs`, `/docs` wins. Tell
 Opeyemi either way.
 
+## What changed (29 Oct 2026)
+
+Regenerate the typed client (§2) first: request and response shapes changed.
+
+- **New `guest` role:** view, download and upload; it can't create subfolders, rename or
+  delete. It's the usual "everyone at the event" QR. New column in the role table (§5).
+- **Join links** take `viewer`, `uploader`, `guest` or `contributor` (they used to be
+  viewer or uploader only).
+- **Sessions no longer combine.** In each folder exactly one session applies (§4). Read
+  the role from that session, not from "the best role anywhere in `/me`".
+- **Logout / switch role:** new `POST /api/v1/logout` (§4). Add a "Lock" or "Use a
+  different PIN" control on the folder page.
+- **Saved PINs and links:** `GET /admin/pins` now returns each PIN's digits in `pin`;
+  `GET /admin/tokens` returns each link's `url`. The admin can see and reprint them at
+  any time instead of copying them down on creation (§10).
+- `POST /admin/tokens` responses: `url` is now part of the token object (still at the
+  top level of the JSON, so `r.url` still works), and `secret` is unchanged.
+- New error code `invalid_logout` (§12).
+
 ---
 
 ## 1. Ground rules
@@ -103,10 +122,26 @@ Full list of codes in §12.
   can do: the one unlocked closest to that folder (hub/admin only where no folder
   session covers it). Example: viewer PIN on `sunday-service`, then uploader QR on
   `day-1` -> `day-1` is upload-only, the rest of `sunday-service` is still view-only.
-  Show the role of the session that applies (the `/me` entry whose folder is the
-  current folder or its nearest ancestor).
+- **Which role applies on screen:** among the `/me` sessions with the same
+  `folder_slug`, take the one whose `path` is the longest prefix of the current path
+  (`""` matches everything; `day-1` matches `day-1` and `day-1/photos`, not `day-10`).
+  None? Then `admin: true` means admin and `hub: true` means hub, otherwise there's no
+  access here.
+
+  ```ts
+  function sessionFor(me: Me, slug: string, path: string) {
+    const covers = (p: string) => p === '' || path === p || path.startsWith(p + '/')
+    return me.sessions
+      .filter((s) => s.folder_slug === slug && covers(s.path))
+      .sort((a, b) => b.path.length - a.path.length)[0]   // undefined -> hub/admin/none
+  }
+  ```
 - **Unlocking a folder again replaces its session.** Entering a contributor PIN where
   the browser has a viewer session for that same folder ends the viewer one.
+- **Switching role needs no logout first:** show the PIN pad (or let them scan another
+  QR) and call unlock for the current folder. The new session is either the same
+  folder's (it replaces the old one) or rooted closer, so it applies. Use logout (below)
+  when they want to *drop* access, e.g. "Lock" on a shared phone.
 
 **Folder page flow** (`/f/{slug}/{path...}`):
 
@@ -306,6 +341,17 @@ the original name.
 
 (All under `/api/v1`.) A folder's shareable link is `http://ark.local/f/{slug}`. Build
 the QR from it, or from a join token's `url`.
+
+**PIN and QR screens:**
+- Default the role picker to **guest** for event-wide PINs and QRs. Explain each choice in
+  one line using §5 (e.g. "Guest: can see, download and add photos; can't delete").
+- List PINs and links per folder with their label, role, uses and expiry, plus the PIN
+  digits (`pin`) or a "Show QR" button (`url` -> `/admin/qr?url=...`). Hide the digits
+  behind a tap if the admin screen might be projected.
+- When `pin` / `url` is `null` on an active entry, it was created before Ark kept them:
+  show "Not available, revoke and create a new one".
+- These lists are admin-only and contain live secrets; don't cache them in
+  `localStorage`.
 
 ## 11. Routes and build
 
