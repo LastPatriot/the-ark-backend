@@ -1,6 +1,6 @@
 # Deploying Ark
 
-Build first: `cargo build --release` (Pi: `cross build --release --target aarch64-unknown-linux-gnu`).
+Build the frontend into `web/dist` first (release builds embed it), then `cargo build --release` (Pi: `cross build --release --target aarch64-unknown-linux-gnu`).
 
 ## Linux (demo PC or Raspberry Pi)
 
@@ -62,7 +62,7 @@ Check with `sudo ss -lunp 'sport = :53'` / `Get-NetUDPEndpoint -LocalPort 53`.
   empty body for a quick tunnel (random `*.trycloudflare.com` URL, no account), or
   `{"token": "...", "hostname": "ark.example.org"}` for a named tunnel from the Cloudflare
   dashboard. It restarts with Ark until `DELETE /api/v1/admin/tunnel`. Anyone on the
-  internet can then reach the PIN pages, so use 6+ digit PINs and consider `ARK_DOCS=false`.
+  internet can then reach the PIN pages, so use 6+ digit PINs and leave `ARK_DOCS` off.
 
 ## Backups
 

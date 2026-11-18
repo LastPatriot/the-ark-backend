@@ -4,9 +4,9 @@ Ark turns any Wi-Fi network into a shared media drive. One Rust server runs on a
 (a PC for the hackathon demo, a Raspberry Pi later). Users join from a browser by
 scanning a QR code; a PIN or join QR unlocks **one folder and its subfolders only**.
 
-This file covers the backend only. The frontend will be built later and consume this
-API. Until then, every endpoint is documented and tested through **Swagger UI**
-(OpenAPI), served by the backend at `/docs`.
+This file covers the backend only. The frontend lives in `web/` and is served from
+`web/dist` (see section 6). Every endpoint is documented and tested through **Swagger UI**
+(OpenAPI), served by the backend at `/docs` when `ARK_DOCS=true`.
 
 - Owner: Opeyemi (backend and platform)
 - Demo freeze: 6 Nov 2026 (submission). Hackathon: 28 Nov 2026.
@@ -29,7 +29,7 @@ API. Until then, every endpoint is documented and tested through **Swagger UI**
 | mDNS | `mdns-sd` |
 | Local DNS server (milestone 3) | `hickory-server` |
 | API docs / testing | `utoipa` (OpenAPI 3 from code) + `utoipa-swagger-ui` (feature `axum`) |
-| Embedded frontend (later) | `rust-embed` |
+| Embedded frontend | `rust-embed` (embedded in release, read from disk in debug) |
 | Hashing files | `sha2` |
 | Logging | `tracing`, `tracing-subscriber` |
 | Errors | `thiserror`, `anyhow` |
@@ -67,7 +67,7 @@ ark/
       join.rs          # /j/{token}
       events.rs        # SSE live updates
       admin.rs         # /api/v1/admin/*
-      static_files.rs  # embedded frontend + SPA fallback (added when the frontend exists)
+      static_files.rs  # web/dist + SPA fallback
     storage.rs         # safe path resolution, .part files, versions, trash
     qr.rs              # QR generation
     discovery.rs       # mDNS announce + IP-change watcher
@@ -77,7 +77,7 @@ ark/
       sync.rs          # milestone 4
   scripts/
     upload_test.sh     # curl-driven tus upload for large files (see section 11)
-  web/dist/            # built frontend, embedded later
+  web/                 # frontend source; web/dist is its build output (gitignored)
 ```
 
 ---
@@ -94,7 +94,7 @@ Environment variables (or `ark.toml`), with defaults:
 | `ARK_SESSION_HOURS` | `12` | Session lifetime |
 | `ARK_COOKIE_KEY` | generated on first run, stored in DB settings | Signs session cookies |
 | `ARK_MAX_CHUNK_MB` | `16` | Upper bound for a single PATCH body |
-| `ARK_DOCS` | `true` | Serve Swagger UI at `/docs`. Set `false`, or admin-only, for real deployments |
+| `ARK_DOCS` | `false` | Serve Swagger UI at `/docs` and the spec at `/api-docs/openapi.json`. Turn on for development |
 
 On first run, if no admin password exists, the server prints a one-time setup code
 to the console and only `/admin/setup` is usable until the admin password is set.
@@ -301,12 +301,12 @@ Every session has a `root_folder`. A request on folder `F` is allowed only if `F
 | --- | --- |
 | `GET /docs` | Swagger UI (when `ARK_DOCS=true`) |
 | `GET /api-docs/openapi.json` | OpenAPI 3 spec, generated from code |
-| `GET /` and `GET /f/{*path}` | Later: serve the frontend app. Until then `/` redirects to `/docs` |
+| Any other `GET` | Frontend: the file from `web/dist`, else `index.html` for paths without an extension (`/`, `/f/...`, `/admin/...`). 503 page when not built |
 | `GET /j/{token}` | Validate join token, create session (role from token), set cookie, `302` to `/f/{slug}` |
 | `GET /dl/{file_id}` | Stream file with `Range` support, `Content-Disposition: attachment`, `X-Content-Type-Options: nosniff` |
 | `GET /preview/{file_id}/{kind}` | Thumbnail/poster; requires viewer-level access to the file's folder |
 | `GET /healthz` | `200 ok` |
-| `GET /assets/*` | Embedded frontend assets |
+| `GET /assets/*` | Frontend assets, cached for a year (`immutable`) |
 
 ### JSON API (`/api/v1`)
 
@@ -453,7 +453,7 @@ Client chunk size: 8 MB (stays under Cloudflare's 100 MB request limit for remot
 
 ```bash
 # run in dev (port 8080, no admin rights needed)
-ARK_BIND=0.0.0.0:8080 ARK_DATA_DIR=./dev-data cargo run
+ARK_BIND=0.0.0.0:8080 ARK_DATA_DIR=./dev-data ARK_DOCS=true cargo run
 
 # migrations
 cargo sqlx migrate run --database-url sqlite://dev-data/ark.db

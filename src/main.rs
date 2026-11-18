@@ -30,7 +30,7 @@ use axum::{
     extract::{FromRef, Request, State},
     http::{HeaderName, HeaderValue},
     middleware::{self, Next},
-    response::{IntoResponse, Redirect, Response},
+    response::{IntoResponse, Response},
     routing::{delete, get, head, options, patch, post},
 };
 use axum_extra::extract::cookie::Key;
@@ -259,15 +259,14 @@ pub fn app(state: AppState) -> Router {
         .route("/zip/{token}", get(routes::zip::download))
         .nest("/api/v1", api);
     if state.cfg.docs {
-        // Until the frontend exists, its pages lead to the API docs.
-        app = app
-            .route("/", get(|| async { Redirect::temporary("/docs") }))
-            .route("/f/{*path}", get(|| async { Redirect::temporary("/docs") }))
-            .merge(
-                SwaggerUi::new("/docs").url("/api-docs/openapi.json", openapi::ApiDoc::openapi()),
-            );
+        app = app.merge(
+            SwaggerUi::new("/docs").url("/api-docs/openapi.json", openapi::ApiDoc::openapi()),
+        );
     }
-    app.layer(TraceLayer::new_for_http()).with_state(state)
+    // Everything else is the frontend: a file from web/dist, or index.html for app routes.
+    app.fallback(routes::static_files::serve)
+        .layer(TraceLayer::new_for_http())
+        .with_state(state)
 }
 
 /// Health check.

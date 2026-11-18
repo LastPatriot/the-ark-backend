@@ -41,7 +41,7 @@ bind = "0.0.0.0:80"
 data_dir = '$DataDir\data'
 hostname = "ark"
 session_hours = 12
-docs = true
+docs = false
 dns = $dnsLine
 dns_bind = "0.0.0.0:53"
 $upstreamLine
@@ -77,7 +77,7 @@ foreach ($i in 1..15) {
     Start-Sleep -Seconds 1
     try { if ((Invoke-WebRequest -UseBasicParsing 'http://127.0.0.1/healthz' -TimeoutSec 2).Content -eq 'ok') { $ok = $true; break } } catch {}
 }
-if ($ok) { Write-Host 'Ark is running: http://ark.local  (docs: http://ark.local/docs)' -ForegroundColor Green }
+if ($ok) { Write-Host 'Ark is running: http://ark.local' -ForegroundColor Green }
 else { Write-Warning "Ark did not answer on port 80 yet; check $Log (is another program using port 80?)" }
 
 $code = Select-String -Path $Log -Pattern 'setup code: (\d+)' -ErrorAction SilentlyContinue | Select-Object -Last 1

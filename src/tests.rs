@@ -1252,3 +1252,34 @@ async fn received_upload_is_finalized_on_next_head() {
         "hello"
     );
 }
+
+#[tokio::test]
+async fn frontend_owns_unclaimed_paths() {
+    let t = TestApp::new().await;
+    // App routes get the shell: index.html when web/dist is built, else a 503 page.
+    for uri in ["/", "/f/sunday-service/photos", "/admin/pins"] {
+        let r = t.call(Method::GET, uri, None, None).await;
+        assert!(
+            r.status == StatusCode::OK || r.status == StatusCode::SERVICE_UNAVAILABLE,
+            "{uri}: {}",
+            r.status
+        );
+        assert!(
+            r.header("content-type").unwrap().starts_with("text/html"),
+            "{uri}"
+        );
+    }
+    // Backend prefixes and missing assets never fall back to the shell.
+    for uri in [
+        "/api/v1/nope",
+        "/docs",
+        "/api-docs/openapi.json",
+        "/assets/missing.js",
+        "/favicon-missing.ico",
+    ] {
+        let r = t.call(Method::GET, uri, None, None).await;
+        assert_eq!(r.status, StatusCode::NOT_FOUND, "{uri}");
+    }
+    let r = t.call(Method::POST, "/f/x", None, None).await;
+    assert_eq!(r.status, StatusCode::METHOD_NOT_ALLOWED);
+}

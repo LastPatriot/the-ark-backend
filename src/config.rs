@@ -16,6 +16,7 @@ pub struct Config {
     /// can see them again. Generated into `<data_dir>/secret.key` when unset.
     pub secret_key: Option<String>,
     pub max_chunk_mb: u64,
+    /// Serve Swagger UI at `/docs` and the spec at `/api-docs/openapi.json`. Off by default.
     pub docs: bool,
     /// Run the local DNS server (answers `<hostname>` and `<hostname>.local`).
     pub dns: bool,
@@ -102,7 +103,7 @@ impl Config {
             max_chunk_mb: parse_env("ARK_MAX_CHUNK_MB")?
                 .or(file.max_chunk_mb)
                 .unwrap_or(16),
-            docs: parse_env("ARK_DOCS")?.or(file.docs).unwrap_or(true),
+            docs: parse_env("ARK_DOCS")?.or(file.docs).unwrap_or(false),
             dns: parse_env("ARK_DNS")?.or(file.dns).unwrap_or(false),
             dns_bind,
             dns_upstream,
@@ -189,7 +190,7 @@ bind = "0.0.0.0:80"
 data_dir = 'C:\ProgramData\Ark\data'
 hostname = "ark"
 session_hours = 12
-docs = true
+docs = false
 dns = true
 dns_bind = "0.0.0.0:53"
 # dns_upstream = "192.168.1.1"  # the router

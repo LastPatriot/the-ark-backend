@@ -5,5 +5,6 @@ pub mod events;
 pub mod folders;
 pub mod items;
 pub mod join;
+pub mod static_files;
 pub mod uploads;
 pub mod zip;

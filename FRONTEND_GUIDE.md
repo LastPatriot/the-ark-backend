@@ -1,7 +1,8 @@
 # Ark Frontend Guide
 
 How the frontend talks to the Ark backend. The contract is the OpenAPI spec at
-`/api-docs/openapi.json` (browse it at `/docs`); this guide covers what the spec
+`/api-docs/openapi.json` (browse it at `/docs`; both need `ARK_DOCS=true`, which is off
+by default); this guide covers what the spec
 can't say: flows, constraints of the venue network, and gotchas.
 
 Backend owner: Opeyemi. If something here disagrees with `/docs`, `/docs` wins. Tell
@@ -57,7 +58,7 @@ Regenerate the typed client (§2) first: request and response shapes changed.
 
 ```bash
 # backend (in the repo root)
-ARK_BIND=0.0.0.0:8080 ARK_DATA_DIR=./dev-data cargo run
+ARK_BIND=0.0.0.0:8080 ARK_DATA_DIR=./dev-data ARK_DOCS=true cargo run
 # first run prints "Ark admin setup code: NNNNNN"
 ```
 
@@ -390,12 +391,22 @@ The app owns these routes (history API, no hash routing):
 | `/f/{slug}` and `/f/{slug}/{sub/path}` | Folder page |
 | `/admin/...` | Admin screens (your choice of sub-routes) |
 
-The backend owns `/api/*`, `/dl/*`, `/preview/*`, `/zip/*`, `/j/*`, `/docs`, `/healthz`.
+The backend owns `/api/*`, `/dl/*`, `/preview/*`, `/zip/*`, `/j/*`, `/docs`, `/api-docs/*`,
+`/healthz`; unknown paths under those are a JSON 404, never the app.
 
-Build output goes to `web/dist/` with assets under `/assets/`. The backend will embed it
-and serve `index.html` for unknown routes (SPA fallback). **That part isn't built on the
-backend yet**; until then `/` and `/f/*` redirect to `/docs`. Tell Opeyemi when you
-have a first build.
+Put the app in `web/` at the repo root; build output goes to `web/dist/` (gitignored)
+with assets under `/assets/` (Vite's defaults). The backend serves every other path from
+`web/dist`:
+
+- A file that exists is served as is. `/assets/*` is cached for a year (`immutable`), so
+  keep Vite's hashed file names; everything else, including `index.html`, is `no-cache`.
+- Any other path without a file extension gets `index.html` (SPA fallback), so `/`,
+  `/f/...` and `/admin/...` all load the app. A missing `name.ext` or `/assets/*` file is
+  a 404.
+- Debug builds (`cargo run`) read `web/dist` from disk on every request, so
+  `npm run build` shows up at `http://localhost:8080` without restarting the backend.
+  Release builds embed `web/dist` into the binary: build the frontend first.
+- With no build, `/` shows a "frontend isn't built yet" page (503).
 
 ## 12. Error codes
 
@@ -416,4 +427,3 @@ have a first build.
 - Editors can't list the trash (only admins can); restore needs the file id.
 - No HEIC thumbnails.
 - Accented letters are dropped from slugs (`Ọdún` -> `d-n`).
-- Serving the built frontend from the backend (§11).
