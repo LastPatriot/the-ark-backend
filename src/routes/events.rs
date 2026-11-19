@@ -28,6 +28,15 @@ pub enum EventKind {
     FileDeleted,
     FolderAdded,
     FolderUpdated,
+    /// An upload into the folder started. `id` is the upload id.
+    UploadStarted,
+    /// More bytes arrived (at most about once a second per upload), or an interrupted
+    /// upload continued. Carries `offset` and `size`.
+    UploadProgress,
+    /// The uploader's connection dropped; the upload waits for them to resume.
+    UploadPaused,
+    /// The upload was cancelled. (A finished upload sends `file_added` instead.)
+    UploadCancelled,
 }
 
 impl EventKind {
@@ -38,6 +47,10 @@ impl EventKind {
             EventKind::FileDeleted => "file_deleted",
             EventKind::FolderAdded => "folder_added",
             EventKind::FolderUpdated => "folder_updated",
+            EventKind::UploadStarted => "upload_started",
+            EventKind::UploadProgress => "upload_progress",
+            EventKind::UploadPaused => "upload_paused",
+            EventKind::UploadCancelled => "upload_cancelled",
         }
     }
 }
@@ -51,17 +64,30 @@ pub struct LiveEvent {
     pub kind: EventKind,
     /// Folder whose listing changed.
     pub folder_id: String,
-    /// File or subfolder id.
+    /// File or subfolder id; the upload id for `upload_*` events.
     pub id: String,
     pub name: Option<String>,
+    /// `upload_*` events: bytes received so far.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub offset: Option<i64>,
+    /// `upload_*` events: total size in bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<i64>,
+}
+
+impl EventKind {
+    /// Events about one session's file or upload, hidden from other uploader sessions.
+    fn is_owned(self) -> bool {
+        !matches!(self, EventKind::FolderAdded | EventKind::FolderUpdated)
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct Broadcast {
-    event: LiveEvent,
+    pub(crate) event: LiveEvent,
     /// `folder_id` and its ancestors, for scope filtering.
     chain: Arc<Vec<String>>,
-    /// Session that uploaded the file; uploader sessions only see their own files.
+    /// Session that uploaded the file; uploader sessions only see their own files and uploads.
     owner_session: Option<String>,
 }
 
@@ -80,6 +106,40 @@ pub async fn publish(
     name: Option<&str>,
     owner_session: Option<&str>,
 ) {
+    send(state, kind, folder_id, id, name, owner_session, None).await;
+}
+
+/// Like `publish`, for `upload_*` events: `progress` is `(offset, size)`.
+pub async fn publish_upload(
+    state: &AppState,
+    kind: EventKind,
+    folder_id: &str,
+    upload_id: &str,
+    name: &str,
+    owner_session: &str,
+    progress: (i64, i64),
+) {
+    send(
+        state,
+        kind,
+        folder_id,
+        upload_id,
+        Some(name),
+        Some(owner_session),
+        Some(progress),
+    )
+    .await;
+}
+
+async fn send(
+    state: &AppState,
+    kind: EventKind,
+    folder_id: &str,
+    id: &str,
+    name: Option<&str>,
+    owner_session: Option<&str>,
+    progress: Option<(i64, i64)>,
+) {
     let chain = match ancestor_chain(&state.db, folder_id).await {
         Ok(c) => c,
         Err(e) => {
@@ -94,6 +154,8 @@ pub async fn publish(
             folder_id: folder_id.to_string(),
             id: id.to_string(),
             name: name.map(str::to_string),
+            offset: progress.map(|p| p.0),
+            size: progress.map(|p| p.1),
         },
         chain: Arc::new(chain),
         owner_session: owner_session.map(str::to_string),
@@ -159,8 +221,7 @@ pub async fn events(
                         if !b.chain.contains(&s.folder_id) {
                             continue;
                         }
-                        let is_file = matches!(b.event.kind, EventKind::FileAdded | EventKind::FileUpdated | EventKind::FileDeleted);
-                        if s.uploader && is_file && b.owner_session.as_deref() != Some(&s.session_id) {
+                        if s.uploader && b.event.kind.is_owned() && b.owner_session.as_deref() != Some(&s.session_id) {
                             continue;
                         }
                         let event = Event::default()

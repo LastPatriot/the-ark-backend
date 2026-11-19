@@ -31,7 +31,7 @@ use axum::{
     http::{HeaderName, HeaderValue},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{delete, get, head, options, patch, post},
+    routing::{delete, get, head, patch, post},
 };
 use axum_extra::extract::cookie::Key;
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -166,7 +166,9 @@ pub fn app(state: AppState) -> Router {
     let uploads = Router::new()
         .route(
             "/uploads",
-            options(routes::uploads::options).post(routes::uploads::create),
+            get(routes::uploads::list)
+                .options(routes::uploads::options)
+                .post(routes::uploads::create),
         )
         .route(
             "/uploads/{id}",
@@ -274,10 +276,12 @@ pub fn app(state: AppState) -> Router {
     get,
     path = "/healthz",
     tag = "system",
-    responses((status = 200, description = "Server is up", body = String, example = "ok"))
+    responses((status = 200, description = "Server is up. Never cached, so clients can poll it \
+        to tell whether Ark is reachable (e.g. before resuming an upload).",
+        body = String, example = "ok"))
 )]
-async fn healthz() -> &'static str {
-    "ok"
+async fn healthz() -> impl axum::response::IntoResponse {
+    ([(axum::http::header::CACHE_CONTROL, "no-store")], "ok")
 }
 
 /// Blocks the API with 503 `setup_required` until the admin password exists.

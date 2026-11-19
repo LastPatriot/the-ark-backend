@@ -69,12 +69,41 @@ pub struct FileItem {
 pub const FILE_ITEM_COLUMNS: &str = "id, name, size, mime, version, status_tag, uploaded_by, created_at,
     (SELECT json_group_array(kind) FROM previews p WHERE p.file_id = files.id AND p.status = 'ready') AS previews";
 
+/// An upload into the folder that hasn't finished. It becomes a file (and leaves this
+/// list) when the last byte arrives; its data can't be downloaded before that.
+#[derive(Debug, Serialize, ToSchema, sqlx::FromRow)]
+pub struct UploadingItem {
+    /// Upload id; `upload_*` live events carry it as `id`.
+    pub id: String,
+    pub name: String,
+    /// Total size in bytes.
+    pub size: i64,
+    /// Bytes received so far.
+    pub offset: i64,
+    /// PIN or join-token label of the uploader (null for uploads from older versions).
+    pub uploaded_by: Option<String>,
+    pub started_at: String,
+    /// Last time bytes arrived.
+    pub updated_at: String,
+    /// True when nothing is arriving: the uploader's connection dropped and the upload
+    /// waits for them to resume. Unfinished uploads idle for 7 days are discarded.
+    #[sqlx(skip)]
+    pub paused: bool,
+}
+
+/// An upload counts as paused when no request is running on it and no bytes arrived
+/// for this long (the gap between two chunks is far shorter).
+const PAUSED_AFTER_SECS: i64 = 15;
+
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ItemsResponse {
     pub folder: FolderSummary,
     pub subfolders: Vec<FolderSummary>,
     /// Current, non-trashed files. Uploader sessions only see their own uploads.
     pub files: Vec<FileItem>,
+    /// Unfinished uploads into this folder (not its subfolders), newest first. Uploader
+    /// sessions only see their own.
+    pub uploading: Vec<UploadingItem>,
 }
 
 #[derive(Debug, Deserialize, IntoParams)]
@@ -613,6 +642,22 @@ pub async fn list_items(
     .fetch_all(&state.db)
     .await?;
 
+    let mut uploading: Vec<UploadingItem> = sqlx::query_as(
+        "SELECT id, filename AS name, size, offset, uploaded_by, created_at AS started_at, updated_at
+         FROM uploads
+         WHERE folder_id = ? AND status = 'active' AND (?2 IS NULL OR session_id = ?2)
+         ORDER BY created_at DESC",
+    )
+    .bind(&folder.id)
+    .bind(own_only)
+    .fetch_all(&state.db)
+    .await?;
+    let idle_since =
+        util::fmt_time(chrono::Utc::now() - chrono::Duration::seconds(PAUSED_AFTER_SECS));
+    for u in &mut uploading {
+        u.paused = u.updated_at < idle_since && !state.uploads.in_flight(&u.id);
+    }
+
     Ok(Json(ItemsResponse {
         subfolders: subfolders
             .into_iter()
@@ -632,6 +677,7 @@ pub async fn list_items(
             created_at: folder.created_at,
         },
         files,
+        uploading,
     }))
 }
 

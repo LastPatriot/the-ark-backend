@@ -5,17 +5,19 @@ use std::{
     io::Read,
     path::PathBuf,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use axum::{
+    Json,
     body::Body,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use futures_util::StreamExt;
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 use tokio::{
@@ -26,8 +28,8 @@ use tokio_util::sync::CancellationToken;
 use utoipa::ToSchema;
 
 use super::{
-    events::{EventKind, publish},
-    folders::resolve,
+    events::{EventKind, publish, publish_upload},
+    folders::{folder_path, resolve},
 };
 use crate::{
     AppState,
@@ -45,6 +47,8 @@ pub const MAX_UPLOAD_BYTES: i64 = 64 << 30;
 pub const FILE_ID_HEADER: &str = "ark-file-id";
 /// A PATCH that receives nothing for this long is treated as a dead connection.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// At most one `upload_progress` event per upload this often.
+const PROGRESS_EVERY: Duration = Duration::from_secs(1);
 
 /// Raw bytes, for the OpenAPI doc.
 #[derive(ToSchema)]
@@ -58,6 +62,8 @@ pub struct BinaryBody(#[allow(dead_code)] Vec<u8>);
 #[derive(Default)]
 pub struct UploadLocks {
     slots: Mutex<HashMap<String, Arc<Slot>>>,
+    /// When each upload last sent `upload_progress`.
+    progress: Mutex<HashMap<String, Instant>>,
 }
 
 struct Slot {
@@ -96,6 +102,34 @@ impl UploadLocks {
 
     fn forget(&self, id: &str) {
         self.slots.lock().unwrap().remove(id);
+        self.progress.lock().unwrap().remove(id);
+    }
+
+    /// Whether a HEAD/PATCH on the upload is running right now.
+    pub fn in_flight(&self, id: &str) -> bool {
+        self.slots
+            .lock()
+            .unwrap()
+            .get(id)
+            .is_some_and(|slot| slot.lock.try_lock().is_err())
+    }
+
+    /// True if a progress event is due (and records it as sent).
+    fn progress_due(&self, id: &str) -> bool {
+        let mut map = self.progress.lock().unwrap();
+        let now = Instant::now();
+        match map.get(id) {
+            Some(last) if now.duration_since(*last) < PROGRESS_EVERY => false,
+            _ => {
+                map.insert(id.to_string(), now);
+                true
+            }
+        }
+    }
+
+    /// The next progress event goes out at once (e.g. after a pause).
+    fn reset_progress(&self, id: &str) {
+        self.progress.lock().unwrap().remove(id);
     }
 }
 
@@ -235,6 +269,143 @@ async fn check_quota(db: &SqlitePool, folder_id: &str, extra: i64) -> AppResult<
     Ok(())
 }
 
+/// Most uploads `GET /uploads` returns.
+const LIST_LIMIT: i64 = 200;
+
+/// One upload in the caller's history.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct UploadSummary {
+    pub id: String,
+    /// tus upload URL: pass it to tus-js-client as `uploadUrl` to resume.
+    #[schema(example = "/api/v1/uploads/01a1ef91-5c57-7275-b977-b35290f8e09d")]
+    pub url: String,
+    pub filename: String,
+    /// Total size in bytes.
+    pub size: i64,
+    /// Bytes the server has. Resume sends from here.
+    pub offset: i64,
+    /// `active` (unfinished, resumable) or `complete`.
+    #[schema(example = "active")]
+    pub status: String,
+    pub folder_id: String,
+    /// Top-level folder slug.
+    pub folder_slug: String,
+    /// Subfolder path below the top-level folder; empty for the top level.
+    pub path: String,
+    /// The stored file, once complete (null if it was since purged).
+    pub file_id: Option<String>,
+    pub created_at: String,
+    /// Last time bytes arrived. Unfinished uploads idle for 7 days are discarded.
+    pub updated_at: String,
+}
+
+#[derive(sqlx::FromRow)]
+struct HistoryRow {
+    id: String,
+    folder_id: String,
+    filename: String,
+    size: i64,
+    offset: i64,
+    status: String,
+    file_id: Option<String>,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct UploadList {
+    /// Newest activity first.
+    pub uploads: Vec<UploadSummary>,
+}
+
+/// Upload history of the caller's sessions: unfinished uploads (resumable) and finished
+/// ones, newest activity first. Terminated uploads are left out.
+///
+/// Uploads belong to the session that started them, so the list survives a page reload
+/// (same cookie) but not a new unlock. A browser can't reopen a file by itself: to resume
+/// an `active` upload the user picks the file again, the client checks the name and size
+/// match, then resumes at `url` (tus HEAD gives the offset).
+#[utoipa::path(
+    get,
+    path = "/api/v1/uploads",
+    tag = "uploads",
+    params(("status" = Option<String>, Query, description = "`active` or `complete` to filter")),
+    security(("ark_session" = []), ("bearer" = [])),
+    responses(
+        (status = 200, body = UploadList),
+        (status = 400, description = "Unknown status filter", body = ErrorBody),
+        (status = 401, description = "No session", body = ErrorBody),
+    )
+)]
+pub async fn list(
+    State(state): State<AppState>,
+    auth: Auth,
+    Query(q): Query<HashMap<String, String>>,
+) -> AppResult<Json<UploadList>> {
+    if auth.sessions.is_empty() {
+        return Err(AppError::unauthorized());
+    }
+    let status = q
+        .get("status")
+        .map(String::as_str)
+        .filter(|s| !s.is_empty());
+    if let Some(s) = status
+        && s != "active"
+        && s != "complete"
+    {
+        return Err(AppError::bad_request(
+            "invalid_status",
+            "status must be active or complete",
+        ));
+    }
+    let ids = serde_json::to_string(&auth.sessions.iter().map(|s| &s.id).collect::<Vec<_>>())
+        .map_err(anyhow::Error::from)?;
+    let rows: Vec<HistoryRow> = sqlx::query_as(
+        "SELECT id, folder_id, filename, size, offset, status, file_id, created_at, updated_at
+             FROM uploads
+             WHERE session_id IN (SELECT value FROM json_each(?1))
+               AND status IN ('active', 'complete')
+               AND (?2 IS NULL OR status = ?2)
+             ORDER BY updated_at DESC, id DESC
+             LIMIT ?3",
+    )
+    .bind(&ids)
+    .bind(status)
+    .bind(LIST_LIMIT)
+    .fetch_all(&state.db)
+    .await?;
+
+    let mut paths: HashMap<String, (String, String)> = HashMap::new();
+    let mut uploads = Vec::with_capacity(rows.len());
+    for r in rows {
+        if !paths.contains_key(&r.folder_id) {
+            match folder_path(&state.db, &r.folder_id).await {
+                Ok(p) => {
+                    paths.insert(r.folder_id.clone(), p);
+                }
+                Err(AppError::NotFound) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        let (folder_slug, path) = paths[&r.folder_id].clone();
+        uploads.push(UploadSummary {
+            url: format!("/api/v1/uploads/{}", r.id),
+            id: r.id,
+            filename: r.filename,
+            size: r.size,
+            offset: r.offset,
+            status: r.status,
+            folder_id: r.folder_id,
+            folder_slug,
+            path,
+            file_id: r.file_id,
+            created_at: r.created_at,
+            updated_at: r.updated_at,
+        });
+    }
+    Ok(Json(UploadList { uploads }))
+}
+
 /// tus capability discovery.
 #[utoipa::path(
     options,
@@ -325,14 +496,16 @@ pub async fn create(
     tokio::fs::File::create(storage::part_path(&state.cfg, &id)).await?;
     let now = util::now();
     sqlx::query(
-        "INSERT INTO uploads (id, folder_id, filename, size, offset, session_id, created_at, updated_at)
-         VALUES (?, ?, ?, ?, 0, ?, ?, ?)",
+        "INSERT INTO uploads (id, folder_id, filename, size, offset, session_id, uploaded_by,
+                              created_at, updated_at)
+         VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(&folder.id)
     .bind(&filename)
     .bind(size)
     .bind(&session.id)
+    .bind(&session.actor)
     .bind(&now)
     .bind(&now)
     .execute(&state.db)
@@ -345,6 +518,17 @@ pub async fn create(
             .ok_or(AppError::NotFound)?;
         let file_id = finalize(&state, &up, &session.actor).await?;
         resp_headers = offset_headers(0, Some(&file_id));
+    } else {
+        publish_upload(
+            &state,
+            EventKind::UploadStarted,
+            &folder.id,
+            &id,
+            &filename,
+            &session.id,
+            (0, size),
+        )
+        .await;
     }
     resp_headers.insert(
         header::LOCATION,
@@ -388,8 +572,10 @@ pub async fn head(
 enum Received {
     /// Body fully read.
     Done,
-    /// Connection dropped, idle too long, or superseded by a newer request.
+    /// Connection dropped or idle too long.
     Interrupted,
+    /// A newer HEAD/PATCH from the client took over (it is already back).
+    Superseded,
     /// Body was longer than the chunk limit or the rest of the upload.
     TooLong,
 }
@@ -484,11 +670,17 @@ pub async fn patch(
     file.seek(std::io::SeekFrom::Start(up.offset as u64))
         .await?;
 
+    // If the client's connection resets, hyper drops this handler mid-body and nothing
+    // below runs; the guard still tells the folder the upload is paused.
+    let mut paused_on_drop = PausedOnDrop {
+        state: Some(state.clone()),
+        up: up.clone(),
+    };
     let mut written: u64 = 0;
     let mut stream = body.into_data_stream();
     let received = loop {
         let next = tokio::select! {
-            _ = guard.cancel.cancelled() => break Received::Interrupted,
+            _ = guard.cancel.cancelled() => break Received::Superseded,
             next = tokio::time::timeout(IDLE_TIMEOUT, stream.next()) => next,
         };
         match next {
@@ -517,7 +709,7 @@ pub async fn patch(
         .await?;
     match received {
         Received::TooLong => return Err(too_long(allowed)),
-        Received::Interrupted => {
+        Received::Interrupted | Received::Superseded => {
             tracing::info!(
                 upload = id,
                 offset,
@@ -525,6 +717,29 @@ pub async fn patch(
             );
         }
         Received::Done => {}
+    }
+    paused_on_drop.disarm();
+    if offset < up.size {
+        let kind = match received {
+            Received::Interrupted => {
+                state.uploads.reset_progress(&id);
+                Some(EventKind::UploadPaused)
+            }
+            _ if state.uploads.progress_due(&id) => Some(EventKind::UploadProgress),
+            _ => None,
+        };
+        if let Some(kind) = kind {
+            publish_upload(
+                &state,
+                kind,
+                &up.folder_id,
+                &id,
+                &up.filename,
+                &up.session_id,
+                (offset, up.size),
+            )
+            .await;
+        }
     }
 
     let mut file_id = None;
@@ -538,6 +753,40 @@ pub async fn patch(
         offset_headers(offset, file_id.as_deref()),
     )
         .into_response())
+}
+
+/// Sends `upload_paused` (at the last stored offset) if dropped before `disarm`.
+struct PausedOnDrop {
+    state: Option<AppState>,
+    up: UploadRow,
+}
+
+impl PausedOnDrop {
+    fn disarm(&mut self) {
+        self.state = None;
+    }
+}
+
+impl Drop for PausedOnDrop {
+    fn drop(&mut self) {
+        let Some(state) = self.state.take() else {
+            return;
+        };
+        let up = self.up.clone();
+        state.uploads.reset_progress(&up.id);
+        tokio::spawn(async move {
+            publish_upload(
+                &state,
+                EventKind::UploadPaused,
+                &up.folder_id,
+                &up.id,
+                &up.filename,
+                &up.session_id,
+                (up.offset, up.size),
+            )
+            .await;
+        });
+    }
 }
 
 /// All bytes arrived but finalizing failed earlier (e.g. disk or database error):
@@ -581,7 +830,7 @@ pub async fn terminate(
     auth: Auth,
     Path(id): Path<String>,
 ) -> AppResult<StatusCode> {
-    load_owned(&state, &auth, &id).await?;
+    let (up, _) = load_owned(&state, &auth, &id).await?;
     let _guard = state.uploads.acquire(&id).await;
     let result = sqlx::query(
         "UPDATE uploads SET status = 'aborted', updated_at = ? WHERE id = ? AND status = 'active'",
@@ -595,6 +844,16 @@ pub async fn terminate(
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
             _ => {}
         }
+        publish_upload(
+            &state,
+            EventKind::UploadCancelled,
+            &up.folder_id,
+            &id,
+            &up.filename,
+            &up.session_id,
+            (up.offset, up.size),
+        )
+        .await;
     }
     state.uploads.forget(&id);
     Ok(StatusCode::NO_CONTENT)

@@ -1283,3 +1283,252 @@ async fn frontend_owns_unclaimed_paths() {
     let r = t.call(Method::POST, "/f/x", None, None).await;
     assert_eq!(r.status, StatusCode::METHOD_NOT_ALLOWED);
 }
+
+#[tokio::test]
+async fn upload_history_lists_own_uploads_for_resuming() {
+    let (t, _) = fixture().await;
+    let editor = t.unlock("sunday-service", "", "1111").await;
+    let uploader = t.unlock("sunday-service", "day-2", "3333").await;
+
+    // One finished upload and one cut off halfway.
+    let r = t
+        .upload(
+            &uploader,
+            "sunday-service",
+            "day-2",
+            "done.mp4",
+            b"all of it",
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::NO_CONTENT, "{}", r.text());
+    let meta = format!(
+        "filename {},folder {},path {}",
+        STANDARD.encode("cut.mp4"),
+        STANDARD.encode("sunday-service"),
+        STANDARD.encode("day-2")
+    );
+    let create = Request::post("/api/v1/uploads")
+        .header(auth_header(&uploader).0, auth_header(&uploader).1)
+        .header("tus-resumable", "1.0.0")
+        .header("upload-length", 10)
+        .header("upload-metadata", meta)
+        .body(Body::empty())
+        .unwrap();
+    let url = t.send(create).await.header("location").unwrap();
+    let patch = Request::patch(&url)
+        .header(auth_header(&uploader).0, auth_header(&uploader).1)
+        .header("tus-resumable", "1.0.0")
+        .header("upload-offset", 0)
+        .header(header::CONTENT_TYPE, "application/offset+octet-stream")
+        .body(Body::from(&b"12345"[..]))
+        .unwrap();
+    assert_eq!(t.send(patch).await.status, StatusCode::NO_CONTENT);
+
+    let r = t.get("/api/v1/uploads", &uploader).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let list = r.json()["uploads"].as_array().unwrap().clone();
+    assert_eq!(list.len(), 2);
+    let cut = list.iter().find(|u| u["filename"] == "cut.mp4").unwrap();
+    assert_eq!(cut["status"], "active");
+    assert_eq!(cut["offset"], 5);
+    assert_eq!(cut["size"], 10);
+    assert_eq!(cut["url"], url.as_str());
+    assert_eq!(cut["folder_slug"], "sunday-service");
+    assert_eq!(cut["path"], "day-2");
+    assert!(cut["file_id"].is_null());
+    let done = list.iter().find(|u| u["filename"] == "done.mp4").unwrap();
+    assert_eq!(done["status"], "complete");
+    assert!(done["file_id"].is_string());
+
+    let r = t.get("/api/v1/uploads?status=active", &uploader).await;
+    let active = r.json()["uploads"].as_array().unwrap().clone();
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0]["filename"], "cut.mp4");
+    let r = t.get("/api/v1/uploads?status=nope", &uploader).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+
+    // Another session sees none of them; no session at all is 401.
+    let r = t.get("/api/v1/uploads", &editor).await;
+    assert_eq!(r.json()["uploads"].as_array().unwrap().len(), 0);
+    let r = t.call(Method::GET, "/api/v1/uploads", None, None).await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED);
+
+    // Terminated uploads drop out of the history.
+    let del = Request::delete(&url)
+        .header(auth_header(&uploader).0, auth_header(&uploader).1)
+        .header("tus-resumable", "1.0.0")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(t.send(del).await.status, StatusCode::NO_CONTENT);
+    let r = t.get("/api/v1/uploads?status=active", &uploader).await;
+    assert_eq!(r.json()["uploads"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn healthz_is_never_cached() {
+    let t = TestApp::new().await;
+    let r = t.call(Method::GET, "/healthz", None, None).await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert_eq!(r.header("cache-control").as_deref(), Some("no-store"));
+}
+
+/// tus creation only; returns the upload URL.
+async fn start_upload(
+    t: &TestApp,
+    sid: &str,
+    slug: &str,
+    path: &str,
+    name: &str,
+    len: usize,
+) -> String {
+    let meta = format!(
+        "filename {},folder {},path {}",
+        STANDARD.encode(name),
+        STANDARD.encode(slug),
+        STANDARD.encode(path)
+    );
+    let req = Request::post("/api/v1/uploads")
+        .header(auth_header(sid).0, auth_header(sid).1)
+        .header("tus-resumable", "1.0.0")
+        .header("upload-length", len)
+        .header("upload-metadata", meta)
+        .body(Body::empty())
+        .unwrap();
+    let r = t.send(req).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    r.header("location").unwrap()
+}
+
+async fn send_chunk(t: &TestApp, sid: &str, url: &str, offset: usize, data: &[u8]) -> Resp {
+    let req = Request::patch(url)
+        .header(auth_header(sid).0, auth_header(sid).1)
+        .header("tus-resumable", "1.0.0")
+        .header("upload-offset", offset)
+        .header(header::CONTENT_TYPE, "application/offset+octet-stream")
+        .body(Body::from(data.to_vec()))
+        .unwrap();
+    t.send(req).await
+}
+
+#[tokio::test]
+async fn folder_listing_shows_uploads_in_progress() {
+    let (t, _) = fixture().await;
+    let editor = t.unlock("sunday-service", "", "1111").await;
+    let uploader = t.unlock("sunday-service", "day-2", "3333").await;
+    let other_uploader = t.unlock("sunday-service", "day-2", "3333").await;
+    let mut events = t.state.events.subscribe();
+
+    let url = start_upload(&t, &uploader, "sunday-service", "day-2", "service.mp4", 10).await;
+    let r = send_chunk(&t, &uploader, &url, 0, b"12345").await;
+    assert_eq!(r.status, StatusCode::NO_CONTENT);
+
+    // The media lead sees it arriving, with progress and who is sending it.
+    let r = t.items(&editor, "sunday-service", "day-2").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let body = r.json();
+    assert_eq!(body["files"].as_array().unwrap().len(), 0);
+    let up = &body["uploading"][0];
+    assert_eq!(up["name"], "service.mp4");
+    assert_eq!(up["offset"], 5);
+    assert_eq!(up["size"], 10);
+    assert_eq!(up["uploaded_by"], "uploader 3333");
+    assert_eq!(up["paused"], false);
+    // Only in its own folder, not the parent's listing.
+    let r = t.items(&editor, "sunday-service", "").await;
+    assert_eq!(r.json()["uploading"].as_array().unwrap().len(), 0);
+    // Another upload-only session doesn't see someone else's upload.
+    let r = t.items(&other_uploader, "sunday-service", "day-2").await;
+    assert_eq!(r.json()["uploading"].as_array().unwrap().len(), 0);
+    let r = t.items(&uploader, "sunday-service", "day-2").await;
+    assert_eq!(r.json()["uploading"].as_array().unwrap().len(), 1);
+
+    // No bytes for a while and nothing running: paused.
+    let old = crate::util::fmt_time(chrono::Utc::now() - chrono::Duration::seconds(60));
+    sqlx::query("UPDATE uploads SET updated_at = ?")
+        .bind(&old)
+        .execute(&t.state.db)
+        .await
+        .unwrap();
+    let r = t.items(&editor, "sunday-service", "day-2").await;
+    assert_eq!(r.json()["uploading"][0]["paused"], true);
+
+    // Finishing turns it into a file.
+    let r = send_chunk(&t, &uploader, &url, 5, b"67890").await;
+    assert_eq!(r.status, StatusCode::NO_CONTENT);
+    let body = t.items(&editor, "sunday-service", "day-2").await.json();
+    assert_eq!(body["uploading"].as_array().unwrap().len(), 0);
+    assert_eq!(body["files"][0]["name"], "service.mp4");
+
+    // Cancelling removes it.
+    let url2 = start_upload(&t, &uploader, "sunday-service", "day-2", "b.mp4", 10).await;
+    let del = Request::delete(&url2)
+        .header(auth_header(&uploader).0, auth_header(&uploader).1)
+        .header("tus-resumable", "1.0.0")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(t.send(del).await.status, StatusCode::NO_CONTENT);
+    let body = t.items(&editor, "sunday-service", "day-2").await.json();
+    assert_eq!(body["uploading"].as_array().unwrap().len(), 0);
+
+    let mut kinds = Vec::new();
+    while let Ok(b) = events.try_recv() {
+        kinds.push((serde_json::to_value(b.event.kind).unwrap(), b.event.offset));
+    }
+    let names: Vec<_> = kinds
+        .iter()
+        .map(|(k, o)| (k.as_str().unwrap().to_string(), *o))
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            ("upload_started".into(), Some(0)),
+            ("upload_progress".into(), Some(5)),
+            ("file_added".into(), None),
+            ("upload_started".into(), Some(0)),
+            ("upload_cancelled".into(), Some(0)),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn dropped_connection_keeps_bytes_and_reports_paused() {
+    let (t, _) = fixture().await;
+    let uploader = t.unlock("sunday-service", "day-2", "3333").await;
+    let url = start_upload(&t, &uploader, "sunday-service", "day-2", "cut.mp4", 10).await;
+    let mut events = t.state.events.subscribe();
+
+    // The phone's Wi-Fi drops after 3 bytes of the chunk.
+    let chunks: Vec<Result<&'static [u8], std::io::Error>> = vec![
+        Ok(b"123"),
+        Err(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "wifi gone",
+        )),
+    ];
+    let req = Request::patch(&url)
+        .header(auth_header(&uploader).0, auth_header(&uploader).1)
+        .header("tus-resumable", "1.0.0")
+        .header("upload-offset", 0)
+        .header(header::CONTENT_TYPE, "application/offset+octet-stream")
+        .body(Body::from_stream(futures_util::stream::iter(chunks)))
+        .unwrap();
+    t.send(req).await;
+
+    let b = events.try_recv().unwrap();
+    assert_eq!(serde_json::to_value(b.event.kind).unwrap(), "upload_paused");
+    assert_eq!(b.event.offset, Some(3));
+
+    // Resume sends only the rest.
+    let head = Request::head(&url)
+        .header(auth_header(&uploader).0, auth_header(&uploader).1)
+        .header("tus-resumable", "1.0.0")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        t.send(head).await.header("upload-offset").as_deref(),
+        Some("3")
+    );
+    let r = send_chunk(&t, &uploader, &url, 3, b"4567890").await;
+    assert_eq!(r.status, StatusCode::NO_CONTENT);
+    assert!(r.header("ark-file-id").is_some());
+}
