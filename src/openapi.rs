@@ -35,6 +35,7 @@ use crate::{auth, error, routes};
         routes::admin::create_pin,
         routes::admin::update_pin,
         routes::admin::revoke_pin,
+        routes::uploads::list,
         routes::uploads::options,
         routes::uploads::create,
         routes::uploads::head,

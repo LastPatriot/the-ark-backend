@@ -305,7 +305,7 @@ Every session has a `root_folder`. A request on folder `F` is allowed only if `F
 | `GET /j/{token}` | Validate join token, create session (role from token), set cookie, `302` to `/f/{slug}` |
 | `GET /dl/{file_id}` | Stream file with `Range` support, `Content-Disposition: attachment`, `X-Content-Type-Options: nosniff` |
 | `GET /preview/{file_id}/{kind}` | Thumbnail/poster; requires viewer-level access to the file's folder |
-| `GET /healthz` | `200 ok` |
+| `GET /healthz` | `200 ok`, `Cache-Control: no-store` (clients poll it to check Ark is reachable) |
 | `GET /assets/*` | Frontend assets, cached for a year (`immutable`) |
 
 ### JSON API (`/api/v1`)
@@ -316,13 +316,14 @@ Every session has a `root_folder`. A request on folder `F` is allowed only if `F
 | `POST /hub/unlock` `{pin}` | Hub PIN -> hub session | none |
 | `POST /folders/{slug}/unlock` `{pin}` | Folder PIN -> scoped session | none |
 | `GET /folders` | Top-level folders | hub |
-| `GET /folders/{slug}/items?path=a/b` | List subfolders and current files (uploader: own files) | viewer |
+| `GET /folders/{slug}/items?path=a/b` | List subfolders, current files and uploads in progress (uploader: own only) | viewer |
 | `POST /folders/{slug}/subfolders` `{path, name}` | Create subfolder | contributor |
 | `PATCH /items/{id}` `{name?, move_to?, status_tag?}` | Rename / move / tag | editor |
 | `DELETE /items/{id}` | Move to trash | editor |
 | `POST /items/{id}/restore` `{version?}` | Restore from trash or older version | editor |
 | `GET /files/{id}/versions` | Version list | editor |
-| `GET /events?folder={slug}` | SSE stream: `file_added`, `file_updated`, `file_deleted`, `folder_added` | viewer |
+| `GET /events?folder={slug}` | SSE stream: `file_added`, `file_updated`, `file_deleted`, `folder_added`, `folder_updated`, `upload_started`, `upload_progress`, `upload_paused`, `upload_cancelled` | viewer |
+| `GET /uploads?status=active\|complete` | Upload history of the caller's sessions, for resuming after a reload | any session |
 | `POST /uploads` ... | tus, see section 7 | uploader |
 
 ### Admin API (`/api/v1/admin`, admin session only)

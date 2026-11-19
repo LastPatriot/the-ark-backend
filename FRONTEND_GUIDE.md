@@ -235,12 +235,26 @@ covers its folder and every subfolder below it.
     "uploaded_by",     // PIN/QR label, e.g. "Photographers" (never a person's name)
     "created_at",
     "previews"         // [] | ["thumb"] | ["poster", "hls"]
+  }],
+  "uploading": [{      // unfinished uploads into this folder, newest first
+    "id",              // upload id (matches `upload_*` events)
+    "name", "size",
+    "offset",          // bytes received so far -> progress = offset / size
+    "uploaded_by",     // PIN/QR label
+    "started_at", "updated_at",
+    "paused"           // true: the uploader's connection dropped, waiting for them
   }]
 }
 ```
 
 Files are newest first, current versions only, trash excluded. Subfolders sort by name.
 Build child links from `subfolder.path`.
+
+**Uploads in progress** show to everyone who can list the folder (uploader sessions: only
+their own), e.g. "Uploading… 45% · from Volunteers", or "Paused at 45%" when `paused`.
+They can't be opened or downloaded yet: the file appears in `files` (and leaves
+`uploading`) the moment the last byte arrives. Update the bar live from the `upload_*`
+events (§8) instead of refetching.
 
 **Previews** (all need the same access as listing):
 
@@ -297,22 +311,83 @@ function uploadFile(file: File, folderSlug: string, path: string) {
   existing file's id back.
 - Several files: run 2–3 uploads in parallel, not 50. The Wi-Fi is the bottleneck.
 
+### Upload history and resuming after a reload
+
+The upload list must not live only in React state: a reload (or a reload while offline)
+wipes it. The server keeps it per session, so rebuild the list from there.
+
+`GET /api/v1/uploads` (optional `?status=active` or `?status=complete`) returns the uploads
+started by this browser's sessions, newest activity first (max 200). Terminated uploads are left out:
+
+```json
+{ "uploads": [
+  { "id": "01a1…", "url": "/api/v1/uploads/01a1…",
+    "filename": "service.mp4", "size": 4294967296, "offset": 1862270976,
+    "status": "active",                 // active = unfinished, resumable; complete = done
+    "folder_id": "…", "folder_slug": "sunday-service", "path": "day-2",
+    "file_id": null,                    // set when complete
+    "created_at": "…", "updated_at": "…" }
+] }
+```
+
+- On app load (and after reconnecting), fetch it and show `active` rows as
+  "Paused at {offset/size}%" with a **Resume** button, and `complete` rows as done.
+- **When the user must pick the file again:** only when the page lost the file, i.e. the
+  page was reloaded, the tab or browser was closed (or the phone's OS killed the
+  backgrounded tab), or the phone restarted. While the same page stays open (Wi-Fi drop,
+  server restart, screen locked briefly) the file is still in memory: Resume, or tus's own
+  retries, continue without asking. On another device it can't be resumed at all
+  (different session): upload it again.
+- A browser can't reopen a file by itself, so in that case **Resume** asks the user to pick the file
+  again; check `file.name === filename && file.size === size`, then resume at the same URL:
+  `new tus.Upload(file, { ...sameOptions, uploadUrl: row.url }).start()`. tus does a HEAD,
+  gets the offset and sends only the rest.
+- **Discard** = `DELETE {url}` (frees the space; the row disappears from the list).
+- History belongs to the session: it survives reloads (same cookie) but a new unlock of
+  the folder starts a new session with an empty history, and its old unfinished uploads
+  can't be resumed. Unfinished uploads idle for 7 days are discarded by the server.
+
+### Detecting that the device is offline
+
+The server can't tell the phone it's offline (it can't reach it), so detect it in the browser:
+
+- **During an upload:** a tus error with no `err.originalResponse` means the request never
+  got an answer, i.e. no connection. Mark the upload paused and show the Resume button.
+  (The server notices the dead connection within 30 s on its side and keeps every byte
+  received.)
+- `window` `offline` / `online` events give a quick hint, but `online` only means "joined
+  some network", not "can reach Ark".
+- **Confirm Ark is reachable** with `fetch('/healthz', { cache: 'no-store' })` (200 `ok`,
+  never cached). Use it when the Resume button is tapped, and optionally poll it every
+  ~5 s while uploads are paused to enable the button / auto-resume.
+- "Internet" isn't needed: Ark works on a Wi-Fi with no internet, so check `/healthz`,
+  not an outside site.
+
 ## 8. Live updates (SSE)
 
 ```ts
 const es = new EventSource(`/api/v1/events?folder=${slug}&path=${encodeURIComponent(path)}`)
-for (const type of ['file_added', 'file_updated', 'file_deleted', 'folder_added', 'folder_updated']) {
+for (const type of ['file_added', 'file_updated', 'file_deleted', 'folder_added', 'folder_updated',
+                    'upload_started', 'upload_cancelled']) {
   es.addEventListener(type, (e) => scheduleRefetch(JSON.parse(e.data)))
 }
+// No refetch needed: update the row's bar in place
+es.addEventListener('upload_progress', (e) => { const d = JSON.parse(e.data); setUploading(d.id, d.offset, d.size, false) })
+es.addEventListener('upload_paused',   (e) => { const d = JSON.parse(e.data); setUploading(d.id, d.offset, d.size, true) })
 es.addEventListener('resync', () => refetchAll())   // events were dropped
 es.onerror = () => { /* EventSource reconnects by itself; if it keeps failing, GET /me */ }
 ```
 
-- Event data: `{ type, folder_id, id, name }`. Events cover the folder **and all its
+- Event data: `{ type, folder_id, id, name }`; `upload_*` events add `offset` and `size`,
+  and their `id` is the upload id. `upload_progress` comes at most once a second per
+  upload (and right away when a paused upload continues, so it also means "resumed").
+  `upload_paused` comes when the server notices the uploader's connection died (within
+  ~30 s). A finished upload sends `file_added` (refetch: it moves from `uploading` to `files`).
+- Events cover the folder **and all its
   subfolders**, so check `folder_id` against the folder on screen, or just refetch the listing.
 - Debounce refetches (~300 ms); a batch upload fires many events.
 - `file_updated` also fires when a thumbnail, poster or HLS stream becomes ready.
-- Uploader sessions only get events for their own files.
+- Uploader sessions only get events for their own files and uploads.
 - The stream closes if the session is revoked; the reconnect then gets 401, so send the
   user back to the PIN pad.
 
