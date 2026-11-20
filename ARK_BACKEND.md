@@ -408,8 +408,9 @@ Client chunk size: 8 MB (stays under Cloudflare's 100 MB request limit for remot
 ## 9. Discovery and QR
 
 - **mDNS:** register `ark.local` (A record for each LAN IPv4) and service `_http._tcp`
-  named "Ark" with `mdns-sd`. Run an IP watcher every 10 s; on change, unregister and
-  re-register immediately.
+  named "Ark" with `mdns-sd`. Run an IP watcher every 5 s; on change, unregister and
+  re-register immediately. While unchanged, re-announce every 5 s: some Android phones only
+  learn the name from these, so it is also how long they need to find Ark after rejoining the Wi-Fi.
 - **QR:** encode `http://ark.local/f/{slug}` (folder link) or `http://ark.local/j/{token}`
   (join link). Medium error correction. Never encode an IP.
 - **Local DNS (milestone 3):** `hickory-server` on UDP/TCP 53 answering `ark.local` and
