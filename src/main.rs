@@ -226,6 +226,11 @@ pub fn app(state: AppState) -> Router {
         .route("/admin/tokens/{id}", delete(routes::join::revoke_token))
         .route("/admin/qr", get(routes::admin_ops::qr_code))
         .route("/admin/sessions", get(routes::admin_ops::list_sessions))
+        .route("/admin/uploads", get(routes::admin_ops::list_uploads))
+        .route(
+            "/admin/uploads/{id}",
+            delete(routes::admin_ops::discard_upload),
+        )
         .route(
             "/admin/sessions/{handle}",
             delete(routes::admin_ops::end_session),

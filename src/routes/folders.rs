@@ -86,14 +86,10 @@ pub struct UploadingItem {
     /// Last time bytes arrived.
     pub updated_at: String,
     /// True when nothing is arriving: the uploader's connection dropped and the upload
-    /// waits for them to resume. Unfinished uploads idle for 7 days are discarded.
+    /// waits for them to resume. Discarded once their session ends, or after 7 idle days.
     #[sqlx(skip)]
     pub paused: bool,
 }
-
-/// An upload counts as paused when no request is running on it and no bytes arrived
-/// for this long (the gap between two chunks is far shorter).
-const PAUSED_AFTER_SECS: i64 = 15;
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ItemsResponse {
@@ -101,8 +97,8 @@ pub struct ItemsResponse {
     pub subfolders: Vec<FolderSummary>,
     /// Current, non-trashed files. Uploader sessions only see their own uploads.
     pub files: Vec<FileItem>,
-    /// Unfinished uploads into this folder (not its subfolders), newest first. Uploader
-    /// sessions only see their own.
+    /// Unfinished uploads into this folder (not its subfolders), newest first. Only the
+    /// uploads this browser's sessions are sending; admin sees everyone's.
     pub uploading: Vec<UploadingItem>,
 }
 
@@ -642,20 +638,24 @@ pub async fn list_items(
     .fetch_all(&state.db)
     .await?;
 
+    // In-progress uploads are private to the browser that is sending them; admin sees all.
+    let mine = (!auth.sessions.iter().any(|s| s.role == Role::Admin)).then(|| {
+        serde_json::to_string(&auth.sessions.iter().map(|s| &s.id).collect::<Vec<_>>())
+            .unwrap_or_default()
+    });
     let mut uploading: Vec<UploadingItem> = sqlx::query_as(
         "SELECT id, filename AS name, size, offset, uploaded_by, created_at AS started_at, updated_at
          FROM uploads
-         WHERE folder_id = ? AND status = 'active' AND (?2 IS NULL OR session_id = ?2)
+         WHERE folder_id = ? AND status = 'active'
+           AND (?2 IS NULL OR session_id IN (SELECT value FROM json_each(?2)))
          ORDER BY created_at DESC",
     )
     .bind(&folder.id)
-    .bind(own_only)
+    .bind(mine)
     .fetch_all(&state.db)
     .await?;
-    let idle_since =
-        util::fmt_time(chrono::Utc::now() - chrono::Duration::seconds(PAUSED_AFTER_SECS));
     for u in &mut uploading {
-        u.paused = u.updated_at < idle_since && !state.uploads.in_flight(&u.id);
+        u.paused = crate::routes::uploads::is_paused(&state, &u.id, &u.updated_at);
     }
 
     Ok(Json(ItemsResponse {

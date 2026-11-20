@@ -1,4 +1,4 @@
-//! Admin: sessions, activity log, storage, trash and QR codes.
+//! Admin: sessions, unfinished uploads, activity log, storage, trash and QR codes.
 
 use axum::{
     Json,
@@ -10,7 +10,10 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 
-use super::{folders::folder_path, uploads::usage};
+use super::{
+    folders::folder_path,
+    uploads::{self, usage},
+};
 use crate::{
     AppState,
     auth::{Auth, Role},
@@ -112,6 +115,136 @@ pub async fn list_sessions(
         });
     }
     Ok(Json(out))
+}
+
+/// An unfinished upload, as the admin sees it.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct AdminUpload {
+    pub id: String,
+    pub filename: String,
+    /// Total size in bytes.
+    pub size: i64,
+    /// Bytes received so far (also the disk space it holds).
+    pub offset: i64,
+    pub folder_id: String,
+    /// `slug` or `slug/sub/path` of the target folder.
+    pub folder: String,
+    /// PIN or join-token label of the uploader.
+    pub uploaded_by: Option<String>,
+    /// Handle of the uploader's session (as in `GET /admin/sessions`).
+    pub session: String,
+    /// False once the uploader's session expired or was ended: nobody can resume it, and
+    /// the cleanup discards it within 10 minutes.
+    pub session_active: bool,
+    /// Nothing arriving right now.
+    pub paused: bool,
+    pub started_at: String,
+    /// Last time bytes arrived.
+    pub updated_at: String,
+}
+
+#[derive(sqlx::FromRow)]
+struct AdminUploadRow {
+    id: String,
+    filename: String,
+    size: i64,
+    offset: i64,
+    folder_id: String,
+    uploaded_by: Option<String>,
+    session_id: String,
+    session_active: bool,
+    started_at: String,
+    updated_at: String,
+}
+
+/// Every unfinished upload, from every session, newest activity first.
+#[utoipa::path(
+    get,
+    path = "/api/v1/admin/uploads",
+    tag = "admin",
+    security(("ark_session" = []), ("bearer" = [])),
+    responses(
+        (status = 200, body = Vec<AdminUpload>),
+        (status = 401, body = ErrorBody),
+        (status = 403, body = ErrorBody),
+    )
+)]
+pub async fn list_uploads(
+    State(state): State<AppState>,
+    auth: Auth,
+) -> AppResult<Json<Vec<AdminUpload>>> {
+    auth.admin()?;
+    let rows: Vec<AdminUploadRow> = sqlx::query_as(
+        "SELECT u.id, u.filename, u.size, u.offset, u.folder_id, u.uploaded_by, u.session_id,
+                COALESCE(s.revoked_at IS NULL AND s.expires_at > ?1, 0) AS session_active,
+                u.created_at AS started_at, u.updated_at
+         FROM uploads u LEFT JOIN sessions s ON s.id = u.session_id
+         WHERE u.status = 'active'
+         ORDER BY u.updated_at DESC",
+    )
+    .bind(util::now())
+    .fetch_all(&state.db)
+    .await?;
+    let mut out = Vec::with_capacity(rows.len());
+    for r in rows {
+        let (slug, path) = folder_path(&state.db, &r.folder_id).await?;
+        out.push(AdminUpload {
+            paused: uploads::is_paused(&state, &r.id, &r.updated_at),
+            session: handle(&r.session_id),
+            folder: if path.is_empty() {
+                slug
+            } else {
+                format!("{slug}/{path}")
+            },
+            id: r.id,
+            filename: r.filename,
+            size: r.size,
+            offset: r.offset,
+            folder_id: r.folder_id,
+            uploaded_by: r.uploaded_by,
+            session_active: r.session_active,
+            started_at: r.started_at,
+            updated_at: r.updated_at,
+        });
+    }
+    Ok(Json(out))
+}
+
+/// Discard an unfinished upload from any session: stops it, deletes its partial data and
+/// frees the space. The uploader's next request on it gets 404.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/admin/uploads/{id}",
+    tag = "admin",
+    params(("id" = String, Path)),
+    security(("ark_session" = []), ("bearer" = [])),
+    responses(
+        (status = 204, description = "Discarded"),
+        (status = 401, body = ErrorBody),
+        (status = 403, body = ErrorBody),
+        (status = 404, description = "No such unfinished upload (it may have just finished)", body = ErrorBody),
+    )
+)]
+pub async fn discard_upload(
+    State(state): State<AppState>,
+    auth: Auth,
+    Path(id): Path<String>,
+) -> AppResult<StatusCode> {
+    let admin = auth.admin()?;
+    let up = uploads::discard(&state, &id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    db::audit(
+        &state.db,
+        &admin.actor,
+        "upload.discard",
+        Some(&up.id),
+        Some(serde_json::json!({
+            "folder_id": up.folder_id, "name": up.filename, "size": up.size, "offset": up.offset,
+        })),
+    )
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// End one session.

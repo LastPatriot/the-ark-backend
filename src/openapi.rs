@@ -56,6 +56,8 @@ use crate::{auth, error, routes};
         routes::join::revoke_token,
         routes::admin_ops::qr_code,
         routes::admin_ops::list_sessions,
+        routes::admin_ops::list_uploads,
+        routes::admin_ops::discard_upload,
         routes::admin_ops::end_session,
         routes::admin_ops::activity,
         routes::admin_ops::storage_report,
