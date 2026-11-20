@@ -316,7 +316,7 @@ Every session has a `root_folder`. A request on folder `F` is allowed only if `F
 | `POST /hub/unlock` `{pin}` | Hub PIN -> hub session | none |
 | `POST /folders/{slug}/unlock` `{pin}` | Folder PIN -> scoped session | none |
 | `GET /folders` | Top-level folders | hub |
-| `GET /folders/{slug}/items?path=a/b` | List subfolders, current files and uploads in progress (uploader: own only) | viewer |
+| `GET /folders/{slug}/items?path=a/b` | List subfolders, current files (uploader: own only) and uploads in progress (own sessions only; admin: all) | viewer |
 | `POST /folders/{slug}/subfolders` `{path, name}` | Create subfolder | contributor |
 | `PATCH /items/{id}` `{name?, move_to?, status_tag?}` | Rename / move / tag | editor |
 | `DELETE /items/{id}` | Move to trash | editor |
@@ -337,6 +337,7 @@ Every session has a `root_folder`. A request on folder `F` is allowed only if `F
 | `POST /tokens` / `DELETE /tokens/{id}` | Join tokens; returns raw token once |
 | `GET /qr?url=...&format=svg\|png` | QR for a folder link or join link |
 | `GET /sessions` / `DELETE /sessions/{id}` | Active sessions, end one |
+| `GET /uploads` / `DELETE /uploads/{id}` | Unfinished uploads from every session, discard one |
 | `GET /activity` | Audit log, paginated |
 | `GET /storage` | Used/free space per folder |
 | `GET /trash` / `DELETE /trash` | List / empty trash |
@@ -398,6 +399,8 @@ Client chunk size: 8 MB (stays under Cloudflare's 100 MB request limit for remot
   (`cover__v2.psd`). Strip path separators, control chars, `..`, reserved Windows names.
 - Every resolved path is canonicalized and must `starts_with` the files root, else 500 + log.
 - Trash: set `deleted_at`; a daily worker hard-deletes files older than 30 days.
+- Unfinished uploads: only the session that started one can resume it, so a worker
+  (every 10 min) discards those whose session expired or was revoked, and any idle 7 days.
 - Never serve user files inline as HTML; always `attachment` + `nosniff`.
 
 ---

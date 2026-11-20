@@ -1,16 +1,28 @@
-//! Hourly cleanup: purges trash older than 30 days and abandons stale uploads.
+//! Cleanup: hourly, purges trash older than 30 days; every 10 minutes, discards unfinished
+//! uploads nobody can resume (their session ended) or that sat idle for 7 days.
 
 use std::time::Duration;
 
 use chrono::Utc;
 
 use super::sync;
-use crate::{AppState, db, storage, util};
+use crate::{AppState, db, routes::uploads, storage, util};
 
 const TRASH_DAYS: i64 = 30;
 const STALE_UPLOAD_DAYS: i64 = 7;
+const UPLOAD_SWEEP: Duration = Duration::from_secs(10 * 60);
 
 pub fn spawn(state: AppState) {
+    let uploads_state = state.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(UPLOAD_SWEEP);
+        loop {
+            tick.tick().await;
+            if let Err(e) = abandon_dead_uploads(&uploads_state).await {
+                tracing::error!(error = ?e, "unfinished upload cleanup failed");
+            }
+        }
+    });
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(60 * 60));
         loop {
@@ -20,9 +32,6 @@ pub fn spawn(state: AppState) {
                 Ok(0) => {}
                 Ok(n) => tracing::info!(files = n, "purged old trash"),
                 Err(e) => tracing::error!(error = ?e, "trash purge failed"),
-            }
-            if let Err(e) = abandon_stale_uploads(&state).await {
-                tracing::error!(error = ?e, "stale upload cleanup failed");
             }
         }
     });
@@ -87,23 +96,34 @@ pub async fn purge(state: &AppState, before: Option<&str>) -> anyhow::Result<u64
     Ok(purged)
 }
 
-async fn abandon_stale_uploads(state: &AppState) -> anyhow::Result<()> {
+/// Discards unfinished uploads that can't be resumed: only the session that started an
+/// upload may continue it, so once that session expired or was ended the partial data is
+/// dead weight. Uploads idle for `STALE_UPLOAD_DAYS` go too. Returns how many.
+pub async fn abandon_dead_uploads(state: &AppState) -> anyhow::Result<usize> {
+    let now = util::now();
     let cutoff = util::fmt_time(Utc::now() - chrono::Duration::days(STALE_UPLOAD_DAYS));
     let ids: Vec<String> = sqlx::query_scalar(
-        "UPDATE uploads SET status = 'aborted', updated_at = ?1
-         WHERE status = 'active' AND updated_at < ?2 RETURNING id",
+        "SELECT u.id FROM uploads u LEFT JOIN sessions s ON s.id = u.session_id
+         WHERE u.status = 'active'
+           AND (u.updated_at < ?2 OR s.id IS NULL OR s.revoked_at IS NOT NULL OR s.expires_at <= ?1)",
     )
-    .bind(util::now())
+    .bind(&now)
     .bind(&cutoff)
     .fetch_all(&state.db)
     .await?;
+    let mut n = 0;
     for id in &ids {
-        remove_if_exists(&storage::part_path(&state.cfg, id)).await?;
+        if uploads::discard(state, id).await?.is_some() {
+            n += 1;
+        }
     }
-    if !ids.is_empty() {
-        tracing::info!(uploads = ids.len(), "abandoned stale uploads");
+    if n > 0 {
+        tracing::info!(
+            uploads = n,
+            "discarded unfinished uploads that can't be resumed"
+        );
     }
-    Ok(())
+    Ok(n)
 }
 
 async fn remove_if_exists(path: &std::path::Path) -> std::io::Result<()> {

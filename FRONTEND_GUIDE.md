@@ -250,8 +250,10 @@ covers its folder and every subfolder below it.
 Files are newest first, current versions only, trash excluded. Subfolders sort by name.
 Build child links from `subfolder.path`.
 
-**Uploads in progress** show to everyone who can list the folder (uploader sessions: only
-their own), e.g. "Uploading… 45% · from Volunteers", or "Paused at 45%" when `paused`.
+**Uploads in progress** are private: each browser only sees the uploads its own
+sessions are sending, whatever the role (an editor doesn't see a volunteer's upload until
+it's finished). Admin sees everyone's. Show them as e.g. "Uploading… 45%", or "Paused at
+45%" when `paused`.
 They can't be opened or downloaded yet: the file appears in `files` (and leaves
 `uploading`) the moment the last byte arrives. Update the bar live from the `upload_*`
 events (§8) instead of refetching.
@@ -345,7 +347,8 @@ started by this browser's sessions, newest activity first (max 200). Terminated 
 - **Discard** = `DELETE {url}` (frees the space; the row disappears from the list).
 - History belongs to the session: it survives reloads (same cookie) but a new unlock of
   the folder starts a new session with an empty history, and its old unfinished uploads
-  can't be resumed. Unfinished uploads idle for 7 days are discarded by the server.
+  can't be resumed. The server discards unfinished uploads within 10 minutes of their
+  session expiring or being ended (nobody can resume them then), and any idle for 7 days.
 
 ### Detecting that the device is offline
 
@@ -387,7 +390,8 @@ es.onerror = () => { /* EventSource reconnects by itself; if it keeps failing, G
   subfolders**, so check `folder_id` against the folder on screen, or just refetch the listing.
 - Debounce refetches (~300 ms); a batch upload fires many events.
 - `file_updated` also fires when a thumbnail, poster or HLS stream becomes ready.
-- Uploader sessions only get events for their own files and uploads.
+- `upload_*` events only reach the browser sending the upload, and admin. Uploader
+  sessions only get file events for their own files.
 - The stream closes if the session is revoked; the reconnect then gets 401, so send the
   user back to the PIN pad.
 
@@ -432,6 +436,7 @@ the original name.
 | QR / join links | `POST /admin/tokens` `{folder_id, role: viewer\|uploader\|guest\|contributor, label, expires_at?, max_uses?}`; `GET /admin/tokens` lists them with their `url` (same `null` rule), so the QR can be shown or reprinted any time; `DELETE /admin/tokens/{id}` |
 | QR image | `<img src="/api/v1/admin/qr?url={encoded url}&format=svg">` (or `png` for printing) |
 | Sessions | `GET /admin/sessions`, `DELETE /admin/sessions/{handle}` |
+| Unfinished uploads | `GET /admin/uploads`: every unfinished upload, `[{ id, filename, size, offset, folder, uploaded_by, session, session_active, paused, started_at, updated_at }]` (`session` = handle as in Sessions). `DELETE /admin/uploads/{id}` discards one (deletes the partial data, frees the space, logged as `upload.discard`). `session_active: false` = nobody can resume it; the server discards those within 10 minutes anyway |
 | Activity | `GET /admin/activity?limit=50&before={next_before}` |
 | Storage | `GET /admin/storage` |
 | Trash | `GET /admin/trash`, `DELETE /admin/trash` (empty now) |

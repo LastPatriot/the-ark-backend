@@ -134,15 +134,15 @@ impl UploadLocks {
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
-struct UploadRow {
-    id: String,
-    folder_id: String,
-    filename: String,
-    size: i64,
-    offset: i64,
-    session_id: String,
-    status: String,
-    file_id: Option<String>,
+pub struct UploadRow {
+    pub id: String,
+    pub folder_id: String,
+    pub filename: String,
+    pub size: i64,
+    pub offset: i64,
+    pub session_id: String,
+    pub status: String,
+    pub file_id: Option<String>,
 }
 
 async fn load_upload(db: &SqlitePool, id: &str) -> AppResult<Option<UploadRow>> {
@@ -295,7 +295,7 @@ pub struct UploadSummary {
     /// The stored file, once complete (null if it was since purged).
     pub file_id: Option<String>,
     pub created_at: String,
-    /// Last time bytes arrived. Unfinished uploads idle for 7 days are discarded.
+    /// Last time bytes arrived. Discarded once their session ends, or after 7 idle days.
     pub updated_at: String,
 }
 
@@ -830,34 +830,55 @@ pub async fn terminate(
     auth: Auth,
     Path(id): Path<String>,
 ) -> AppResult<StatusCode> {
-    let (up, _) = load_owned(&state, &auth, &id).await?;
-    let _guard = state.uploads.acquire(&id).await;
+    load_owned(&state, &auth, &id).await?;
+    discard(&state, &id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Aborts an unfinished upload: stops a running PATCH, deletes the partial data and
+/// sends `upload_cancelled`. Returns the upload if it was unfinished (and is now gone);
+/// `None` if it was unknown, complete or already aborted.
+pub async fn discard(state: &AppState, id: &str) -> AppResult<Option<UploadRow>> {
+    let guard = state.uploads.acquire(id).await;
+    let up = load_upload(&state.db, id).await?;
     let result = sqlx::query(
         "UPDATE uploads SET status = 'aborted', updated_at = ? WHERE id = ? AND status = 'active'",
     )
     .bind(util::now())
-    .bind(&id)
+    .bind(id)
     .execute(&state.db)
     .await?;
-    if result.rows_affected() > 0 {
-        match tokio::fs::remove_file(storage::part_path(&state.cfg, &id)).await {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
-            _ => {}
-        }
-        publish_upload(
-            &state,
-            EventKind::UploadCancelled,
-            &up.folder_id,
-            &id,
-            &up.filename,
-            &up.session_id,
-            (up.offset, up.size),
-        )
-        .await;
+    drop(guard);
+    state.uploads.forget(id);
+    let Some(up) = up.filter(|_| result.rows_affected() > 0) else {
+        return Ok(None);
+    };
+    match tokio::fs::remove_file(storage::part_path(&state.cfg, id)).await {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+        _ => {}
     }
-    state.uploads.forget(&id);
-    Ok(StatusCode::NO_CONTENT)
+    publish_upload(
+        state,
+        EventKind::UploadCancelled,
+        &up.folder_id,
+        id,
+        &up.filename,
+        &up.session_id,
+        (up.offset, up.size),
+    )
+    .await;
+    Ok(Some(up))
 }
+
+/// True when nothing is arriving on an unfinished upload: no request is running on it
+/// and no bytes came for `PAUSED_AFTER_SECS` (the gap between two chunks is far shorter).
+pub fn is_paused(state: &AppState, id: &str, updated_at: &str) -> bool {
+    let idle_since =
+        util::fmt_time(chrono::Utc::now() - chrono::Duration::seconds(PAUSED_AFTER_SECS));
+    updated_at < idle_since.as_str() && !state.uploads.in_flight(id)
+}
+
+const PAUSED_AFTER_SECS: i64 = 15;
 
 async fn sha256_file(path: PathBuf) -> AppResult<String> {
     tokio::task::spawn_blocking(move || -> std::io::Result<String> {

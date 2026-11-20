@@ -80,6 +80,17 @@ impl EventKind {
     fn is_owned(self) -> bool {
         !matches!(self, EventKind::FolderAdded | EventKind::FolderUpdated)
     }
+
+    /// Upload-in-progress events: only the uploader's own sessions and admin get them.
+    fn is_upload(self) -> bool {
+        matches!(
+            self,
+            EventKind::UploadStarted
+                | EventKind::UploadProgress
+                | EventKind::UploadPaused
+                | EventKind::UploadCancelled
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -87,7 +98,8 @@ pub struct Broadcast {
     pub(crate) event: LiveEvent,
     /// `folder_id` and its ancestors, for scope filtering.
     chain: Arc<Vec<String>>,
-    /// Session that uploaded the file; uploader sessions only see their own files and uploads.
+    /// Session that uploaded the file. Uploader sessions only see their own files;
+    /// `upload_*` events only reach the uploader's own sessions and admin.
     owner_session: Option<String>,
 }
 
@@ -175,6 +187,9 @@ struct StreamState {
     tick: tokio::time::Interval,
     state: AppState,
     session_id: String,
+    /// Every session the browser presented, to match the owner of `upload_*` events.
+    own_sessions: Vec<String>,
+    admin: bool,
     uploader: bool,
     folder_id: String,
 }
@@ -208,6 +223,8 @@ pub async fn events(
         rx: state.events.subscribe(),
         tick,
         session_id: session.id.clone(),
+        own_sessions: auth.sessions.iter().map(|s| s.id.clone()).collect(),
+        admin: auth.sessions.iter().any(|s| s.role == Role::Admin),
         uploader: session.role == Role::Uploader,
         folder_id: folder.id,
         state,
@@ -222,6 +239,12 @@ pub async fn events(
                             continue;
                         }
                         if s.uploader && b.event.kind.is_owned() && b.owner_session.as_deref() != Some(&s.session_id) {
+                            continue;
+                        }
+                        if b.event.kind.is_upload()
+                            && !s.admin
+                            && !b.owner_session.as_ref().is_some_and(|o| s.own_sessions.contains(o))
+                        {
                             continue;
                         }
                         let event = Event::default()

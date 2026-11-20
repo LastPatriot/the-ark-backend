@@ -1412,7 +1412,7 @@ async fn send_chunk(t: &TestApp, sid: &str, url: &str, offset: usize, data: &[u8
 
 #[tokio::test]
 async fn folder_listing_shows_uploads_in_progress() {
-    let (t, _) = fixture().await;
+    let (t, admin) = fixture().await;
     let editor = t.unlock("sunday-service", "", "1111").await;
     let uploader = t.unlock("sunday-service", "day-2", "3333").await;
     let other_uploader = t.unlock("sunday-service", "day-2", "3333").await;
@@ -1422,8 +1422,8 @@ async fn folder_listing_shows_uploads_in_progress() {
     let r = send_chunk(&t, &uploader, &url, 0, b"12345").await;
     assert_eq!(r.status, StatusCode::NO_CONTENT);
 
-    // The media lead sees it arriving, with progress and who is sending it.
-    let r = t.items(&editor, "sunday-service", "day-2").await;
+    // The uploader sees their own upload arriving, with progress.
+    let r = t.items(&uploader, "sunday-service", "day-2").await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());
     let body = r.json();
     assert_eq!(body["files"].as_array().unwrap().len(), 0);
@@ -1433,14 +1433,17 @@ async fn folder_listing_shows_uploads_in_progress() {
     assert_eq!(up["size"], 10);
     assert_eq!(up["uploaded_by"], "uploader 3333");
     assert_eq!(up["paused"], false);
-    // Only in its own folder, not the parent's listing.
-    let r = t.items(&editor, "sunday-service", "").await;
+    // Nobody else sees it, whatever their role: not an editor, not another session on
+    // the same PIN. Admin sees everyone's.
+    let r = t.items(&editor, "sunday-service", "day-2").await;
     assert_eq!(r.json()["uploading"].as_array().unwrap().len(), 0);
-    // Another upload-only session doesn't see someone else's upload.
     let r = t.items(&other_uploader, "sunday-service", "day-2").await;
     assert_eq!(r.json()["uploading"].as_array().unwrap().len(), 0);
-    let r = t.items(&uploader, "sunday-service", "day-2").await;
-    assert_eq!(r.json()["uploading"].as_array().unwrap().len(), 1);
+    let r = t.items(&admin, "sunday-service", "day-2").await;
+    assert_eq!(r.json()["uploading"][0]["name"], "service.mp4");
+    // Only in its own folder, not the parent's listing.
+    let r = t.items(&admin, "sunday-service", "").await;
+    assert_eq!(r.json()["uploading"].as_array().unwrap().len(), 0);
 
     // No bytes for a while and nothing running: paused.
     let old = crate::util::fmt_time(chrono::Utc::now() - chrono::Duration::seconds(60));
@@ -1449,13 +1452,13 @@ async fn folder_listing_shows_uploads_in_progress() {
         .execute(&t.state.db)
         .await
         .unwrap();
-    let r = t.items(&editor, "sunday-service", "day-2").await;
+    let r = t.items(&uploader, "sunday-service", "day-2").await;
     assert_eq!(r.json()["uploading"][0]["paused"], true);
 
     // Finishing turns it into a file.
     let r = send_chunk(&t, &uploader, &url, 5, b"67890").await;
     assert_eq!(r.status, StatusCode::NO_CONTENT);
-    let body = t.items(&editor, "sunday-service", "day-2").await.json();
+    let body = t.items(&uploader, "sunday-service", "day-2").await.json();
     assert_eq!(body["uploading"].as_array().unwrap().len(), 0);
     assert_eq!(body["files"][0]["name"], "service.mp4");
 
@@ -1467,7 +1470,7 @@ async fn folder_listing_shows_uploads_in_progress() {
         .body(Body::empty())
         .unwrap();
     assert_eq!(t.send(del).await.status, StatusCode::NO_CONTENT);
-    let body = t.items(&editor, "sunday-service", "day-2").await.json();
+    let body = t.items(&uploader, "sunday-service", "day-2").await.json();
     assert_eq!(body["uploading"].as_array().unwrap().len(), 0);
 
     let mut kinds = Vec::new();
@@ -1531,4 +1534,141 @@ async fn dropped_connection_keeps_bytes_and_reports_paused() {
     let r = send_chunk(&t, &uploader, &url, 3, b"4567890").await;
     assert_eq!(r.status, StatusCode::NO_CONTENT);
     assert!(r.header("ark-file-id").is_some());
+}
+
+/// Event names an SSE stream delivers within `wait`.
+async fn sse_events(t: &TestApp, sid: &str, uri: &str, wait: std::time::Duration) -> Vec<String> {
+    let req = Request::get(uri)
+        .header(auth_header(sid).0, auth_header(sid).1)
+        .body(Body::empty())
+        .unwrap();
+    let mut body = t.app.clone().oneshot(req).await.unwrap().into_body();
+    let mut text = String::new();
+    let deadline = tokio::time::Instant::now() + wait;
+    while let Ok(Some(Ok(frame))) = tokio::time::timeout_at(deadline, body.frame()).await {
+        if let Some(data) = frame.data_ref() {
+            text.push_str(&String::from_utf8_lossy(data));
+        }
+    }
+    text.lines()
+        .filter_map(|l| l.strip_prefix("event:"))
+        .map(|e| e.trim().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn upload_events_only_reach_the_uploader_and_admin() {
+    let (t, admin) = fixture().await;
+    let editor = t.unlock("sunday-service", "", "1111").await;
+    let uploader = t.unlock("sunday-service", "day-2", "3333").await;
+    let uri = "/api/v1/events?folder=sunday-service&path=day-2";
+    let wait = std::time::Duration::from_millis(400);
+
+    let streams = async {
+        tokio::join!(
+            sse_events(&t, &editor, uri, wait),
+            sse_events(&t, &uploader, uri, wait),
+            sse_events(&t, &admin, uri, wait),
+        )
+    };
+    let upload = async {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let url = start_upload(&t, &uploader, "sunday-service", "day-2", "a.mp4", 10).await;
+        send_chunk(&t, &uploader, &url, 0, b"12345").await;
+    };
+    let ((editor_ev, uploader_ev, admin_ev), ()) = tokio::join!(streams, upload);
+    assert!(
+        !editor_ev.iter().any(|e| e.starts_with("upload_")),
+        "{editor_ev:?}"
+    );
+    assert_eq!(uploader_ev, ["upload_started", "upload_progress"]);
+    assert_eq!(admin_ev, ["upload_started", "upload_progress"]);
+}
+
+#[tokio::test]
+async fn admin_lists_and_discards_unfinished_uploads() {
+    let (t, admin) = fixture().await;
+    let editor = t.unlock("sunday-service", "", "1111").await;
+    let uploader = t.unlock("sunday-service", "day-2", "3333").await;
+    let url = start_upload(&t, &uploader, "sunday-service", "day-2", "cut.mp4", 10).await;
+    send_chunk(&t, &uploader, &url, 0, b"12345").await;
+    let id = url.rsplit('/').next().unwrap().to_string();
+
+    assert_eq!(
+        t.get("/api/v1/admin/uploads", &editor).await.status,
+        StatusCode::FORBIDDEN
+    );
+    let r = t.get("/api/v1/admin/uploads", &admin).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let up = &r.json()[0];
+    assert_eq!(up["id"], id.as_str());
+    assert_eq!(up["folder"], "sunday-service/day-2");
+    assert_eq!(up["offset"], 5);
+    assert_eq!(up["uploaded_by"], "uploader 3333");
+    assert_eq!(up["session_active"], true);
+    assert!(up["session"].as_str().unwrap().len() == 16);
+
+    // Only admin may discard someone else's upload.
+    let del = |sid: &str| {
+        Request::delete(format!("/api/v1/admin/uploads/{id}"))
+            .header(auth_header(sid).0, auth_header(sid).1)
+            .body(Body::empty())
+            .unwrap()
+    };
+    assert_eq!(t.send(del(&editor)).await.status, StatusCode::FORBIDDEN);
+    assert_eq!(t.send(del(&admin)).await.status, StatusCode::NO_CONTENT);
+    assert!(!crate::storage::part_path(&t.state.cfg, &id).exists());
+    assert_eq!(t.send(del(&admin)).await.status, StatusCode::NOT_FOUND);
+    // The uploader can't carry on with it, and it's gone from the lists.
+    let r = send_chunk(&t, &uploader, &url, 5, b"67890").await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND);
+    let r = t.get("/api/v1/admin/uploads", &admin).await;
+    assert_eq!(r.json().as_array().unwrap().len(), 0);
+    let r = t.get("/api/v1/uploads", &uploader).await;
+    assert_eq!(r.json()["uploads"].as_array().unwrap().len(), 0);
+    let r = t.get("/api/v1/admin/activity", &admin).await;
+    assert!(r.text().contains("upload.discard"), "{}", r.text());
+}
+
+#[tokio::test]
+async fn uploads_of_ended_sessions_are_discarded() {
+    let (t, admin) = fixture().await;
+    let gone = t.unlock("sunday-service", "day-2", "3333").await;
+    let live = t.unlock("sunday-service", "day-2", "3333").await;
+    let dead_url = start_upload(&t, &gone, "sunday-service", "day-2", "a.mp4", 10).await;
+    send_chunk(&t, &gone, &dead_url, 0, b"12345").await;
+    let live_url = start_upload(&t, &live, "sunday-service", "day-2", "b.mp4", 10).await;
+    send_chunk(&t, &live, &live_url, 0, b"12345").await;
+    let dead_id = dead_url.rsplit('/').next().unwrap().to_string();
+
+    // The first browser's session expires mid-upload.
+    let past = crate::util::fmt_time(chrono::Utc::now() - chrono::Duration::minutes(1));
+    sqlx::query("UPDATE sessions SET expires_at = ? WHERE id = ?")
+        .bind(&past)
+        .bind(&gone)
+        .execute(&t.state.db)
+        .await
+        .unwrap();
+    let r = t.get("/api/v1/admin/uploads", &admin).await;
+    let list = r.json();
+    let dead = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|u| u["id"] == dead_id.as_str())
+        .unwrap();
+    assert_eq!(dead["session_active"], false);
+
+    let n = crate::workers::trash::abandon_dead_uploads(&t.state)
+        .await
+        .unwrap();
+    assert_eq!(n, 1);
+    assert!(!crate::storage::part_path(&t.state.cfg, &dead_id).exists());
+    let r = t.get("/api/v1/admin/uploads", &admin).await;
+    let left = r.json();
+    assert_eq!(left.as_array().unwrap().len(), 1);
+    assert_eq!(left[0]["filename"], "b.mp4");
+    // The live one carries on.
+    let r = send_chunk(&t, &live, &live_url, 5, b"67890").await;
+    assert_eq!(r.status, StatusCode::NO_CONTENT);
 }
